@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
 #include "auth_hook.h"
 #include "config.h"
 #include "logger.h"
@@ -47,7 +48,7 @@
  * HMAC_Result is a thin wrapper - OpenSSL handles all the complexity:
  * key padding, ipad/opad construction, and two-pass SHA-256.
  */
-int compute_hmac_sha256(const uint8_t *key, size_t klen,
+static int compute_hmac_sha256(const uint8_t *key, size_t klen,
     const uint8_t *msg, size_t mlen, uint8_t *output)
 {
     unsigned int outlen = 0;

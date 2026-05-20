@@ -87,9 +87,4 @@ struct auth_result http_auth_hook(struct auth_request request);
  */
 auth_hook_fn select_auth_hook(const struct engine_config *config);
 
-// Exposed for testing only — not part of the public auth hook API
-#include <stdint.h>
-int compute_hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg,
-    size_t mlen, uint8_t *output);
-
 #endif

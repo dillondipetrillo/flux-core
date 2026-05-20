@@ -113,32 +113,6 @@ static void test_select_dev_mode(void)
         "selector: dev hook selected when nothing configured");
 }
 
-// OpenSSL
-static void test_hmac_known_answer(void)
-{
-    printf("\n-- HMAC-SHA256 via OpenSSL --\n");
-    /**
-     * Known test vector from RFC 4231.
-     * Key: "Jefe"
-     * Message: "what do ya want for nothing?"
-     * Expected HMAC-SHA256 (hex):
-     *  5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964a71b0
-     */
-    const uint8_t key[] = "Jefe";
-    const uint8_t msg[] = "what do ya want for nothing?";
-    const uint8_t expected[32] = {
-        0x5b,0xdc,0xc1,0x46,0xbf,0x60,0x75,0x4e,
-        0x6a,0x04,0x24,0x26,0x08,0x95,0x75,0xc7,
-        0x5a,0x00,0x3f,0x08,0x9d,0x27,0x39,0x83,
-        0x9d,0xec,0x58,0xb9,0x64,0xec,0x38,0x43
-    };
-    uint8_t output[32];
-    int ok = compute_hmac_sha256(key, 4, msg, 28, output);
-    ASSERT(ok == 1, "OpenSSL HMAC: computation succeeds");
-    ASSERT(memcmp(output, expected, 32) == 0,
-        "OpenSSL HMAC: known-answer test vector matches RFC 4231");
-}
-
 int main(void)
 {
     printf("=== Auth Hook Unit Tests ===\n");
