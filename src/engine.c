@@ -1,5 +1,8 @@
+#include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #include "auth_hook.h"
@@ -107,8 +110,23 @@ int engine_init (struct engine_config *config)
     signal(SIGTERM, handle_shutdown);
     signal(SIGINT, handle_shutdown);
     signal(SIGHUP, handle_sighup);
-
     log_info("Signal handlers registered");
+
+    
+    // Raise soft file descriptor to the hard limit maximum
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) == -1) {
+            int e = errno;
+            log_error("setrlimit failed: %s - fd limit may be low",
+                strerror(e));
+        }
+        // Read back actual result, OS may cap it
+        getrlimit(RLIMIT_NOFILE, &rl);
+    }
+    log_info("File descriptor limit: %lu", (unsigned long)rl.rlim_cur);
+
     return 0;
 }
 
