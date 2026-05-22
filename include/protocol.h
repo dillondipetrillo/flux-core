@@ -4,11 +4,11 @@
 #include <stdint.h>
 #include <time.h>
 
-#define MAX_BUFF_SIZE 8192
+#define MAX_BUFF_SIZE 8192  // per-client receieve buffer
 #define MAX_CLIENTS 10000
 #define MAX_NAME 32
 #define MAX_PAYLOAD 1024
-#define MAX_SEND_BUFF 65536
+#define MAX_SEND_BUFF 65536 // per-client send queue
 #define MAX_SCOPES 16
 
 enum packet_type {
@@ -38,20 +38,20 @@ enum status_code {
 };
 
 struct client_info {
-    int is_authenticated;
+    int is_authenticated;           // 1 after successful IDENTIFY
     int scope_count;
     int socket_fd;
     uint32_t client_id;
     uint32_t scopes[MAX_SCOPES];
-    uint32_t user_id;
-    char recv_buf[MAX_BUFF_SIZE];
-    char send_buf[MAX_SEND_BUFF];
-    char session_token[256];
-    size_t recv_len;
-    size_t send_len;
-    size_t send_offset;
-    uint64_t bytes_sent;
-    uint64_t bytes_recv;
+    uint32_t user_id;               // returned by auth hook
+    char recv_buf[MAX_BUFF_SIZE];   // accumulates partial packets
+    char send_buf[MAX_SEND_BUFF];   // outbound queue for slow clients
+    char session_token[256];        // raw token from client
+    size_t recv_len;                // bytes currently in recv_buf
+    size_t send_len;                // bytes queued to send
+    size_t send_offset;             // bytes already sent from send_buf
+    uint64_t bytes_sent;            // lifetime total, for billing
+    uint64_t bytes_recv;            // lifetime total, for billing
 };
 
 struct __attribute__((packed)) packet_header {

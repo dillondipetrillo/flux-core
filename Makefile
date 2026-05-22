@@ -5,9 +5,11 @@ LDFLAGS = -lpthread -lssl -lcrypto -lcurl
 ENGINE_SRCS = src/main.c \
 	src/auth_hook.c \
 	src/config.c \
+	src/conn_map.c \
 	src/engine.c \
 	src/logger.c \
-	src/utils.c \
+	src/scope_map.c \
+	src/utils.c
 
 TEST_AUTH = tests/test_auth_hook.c src/auth_hook.c src/logger.c
 

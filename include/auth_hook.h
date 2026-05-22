@@ -87,4 +87,10 @@ struct auth_result http_auth_hook(struct auth_request request);
  */
 auth_hook_fn select_auth_hook(const struct engine_config *config);
 
+// Call once before any HTTP auth requests, before fork()
+void auth_http_curl_init(void);
+
+// Call during graceful shutdown
+void auth_http_curl_cleanup(void);
+
 #endif

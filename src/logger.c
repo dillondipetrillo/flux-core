@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #define INFO "INFO"
 
 static FILE *log_file = NULL;
+static FILE *billing_file = NULL;
 
 int logger_init(const char *filepath)
 {
@@ -70,4 +72,51 @@ void log_error(const char *fmt, ...)
     va_start(args, fmt);
     log_write(ERROR, fmt, args);
     va_end(args);
+}
+
+void logger_reopen(void)
+{
+    // Placeholder for actual file close/reopen for log rotation
+    log_info("logger_reopen called (placeholder implementation)");
+}
+
+int billing_log_init(const char *filepath)
+{
+    billing_file = fopen(filepath, "a");
+    if (!billing_file) {
+        log_error("billing_log_init: could not open %s", filepath);
+        return -1;
+    }
+    return 0;
+}
+
+void billing_log_connect(int fd, struct sockaddr_in *addr)
+{
+    if (!billing_file) return;
+    fprintf(billing_file,
+        "{\"ts\":%lu,\"event\":\"connect\",\"fd\":%d,\"ip\":\"%s\"}\n",
+        (unsigned long)time(NULL), fd,
+        addr ? inet_ntoa(addr->sin_addr) : "unknown");
+    fflush(billing_file);
+}
+
+void billing_log_auth(int fd, uint32_t user_id)
+{
+    if (!billing_file) return;
+    fprintf(billing_file,
+        "{\"ts\":%lu,\"event\":\"auth\",\"fd\":%d,\"user_id\":%u}\n",
+        (unsigned long)time(NULL), fd, user_id);
+    fflush(billing_file);
+}
+
+void billing_log_disconnect(int fd, uint32_t user_id, uint64_t bytes_sent,
+    uint64_t bytes_recv)
+{
+    if (!billing_file) return;
+    fprintf(billing_file,
+        "{\"ts\":%lu,\"event\":\"disconnect\",\"fd\":%d,"
+        "\"user_id\":%u,\"bytes_sent\":%lu,\"bytes_recv\":%lu}\n",
+        (unsigned long)time(NULL), fd, user_id,
+        (unsigned long)bytes_sent, (unsigned long)bytes_recv);
+    fflush(billing_file);
 }
