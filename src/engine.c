@@ -50,6 +50,7 @@ static int free_count = 0;
  * to be able to call each other in any order below.
  * ===========================================================
  */
+static int set_nonblocking(int fd);
 
  /**
   * ===========================================================
@@ -95,7 +96,6 @@ int engine_init (struct engine_config *config)
 {
     cfg = config;
     start_time = time(NULL);
-
     // Default to dev hook until engine_set_auth_hook() is called
     current_hook = default_auth_hook;
 
@@ -126,6 +126,55 @@ int engine_init (struct engine_config *config)
         getrlimit(RLIMIT_NOFILE, &rl);
     }
     log_info("File descriptor limit: %lu", (unsigned long)rl.rlim_cur);
+
+    /**
+     * libcurl Init.
+     * Must be called before any fork() because curl_global_init is not
+     * safe to call after forking.
+     */
+    auth_http_curl_init();
+
+    // Data structures
+    scope_map_init(&scope_map);
+    conn_map_init(&conn_map);
+    billing_log_init(config->billing_log_path);
+
+    // Memory pool
+    int pool_size = config->max_clients < POOL_MAX ? config->max_clients :
+        POOL_MAX;
+    for (int i = 0; i < pool_size; i++) {
+        memset(&pool[i], 0, sizeof(struct client_info));
+        free_list[i] = &pool[i];
+    }
+    free_count = pool_size;
+    log_info("Memory pool: %d client slots pre-allocated", pool_size);
+
+    // Server socket
+    server_fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        log_error("socket: %s", strerror(errno));
+        return -1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    set_nonblocking(server_fd);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)config->port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        log_error("bind port %d: %s", config->port, strerror(errno));
+        return -1;
+    }
+    if (listen(server_fd, config->backlog) == -1) {
+        log_error("listen: %s", strerror(errno));
+        return -1;
+    }
 
     return 0;
 }
