@@ -59,6 +59,18 @@ static void handle_new_connections(void);
 static void setup_client_socket(int fd);
 static struct client_info *pool_alloc(void);
 static void handle_health_check(void);
+static void disconnect_client(int fd);
+static void pool_free(struct client_info *client);
+static void handle_client_readable(int fd);
+static void process_recv_buffer(struct client_info *client, int fd);
+static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
+    uint32_t scope_id, uint32_t sender_id, uint64_t expires_at, char *payload,
+    uint32_t payload_len);
+static void engine_send_response(int fd, enum packet_type type,
+    enum status_code code);
+static int engine_send(int fd, const char *data, size_t len);
+static int engine_queue_send(struct client_info *client, const char *data, 
+    size_t len);
 
  /**
   * ===========================================================
@@ -262,6 +274,10 @@ void engine_run(void)
                 handle_new_connections();
             else if (fd == health_fd)
                 handle_health_check();
+            else if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+                disconnect_client(fd);
+            else if (events[i].events & EPOLLIN)
+                handle_client_readable(fd);
         }
     }
 }
@@ -285,6 +301,116 @@ static struct client_info *pool_alloc(void)
     struct client_info *c = free_list[--free_count];
     memset(c, 0, sizeof(*c));
     return c;
+}
+
+static void pool_free(struct client_info *client)
+{
+    if (!client) return;
+    memset(client, 0, sizeof(*client));
+    free_list[free_count++] = client;
+}
+
+/**
+ * engine_send - send data to a client, handling partial sends.
+ * 
+ * With non-blocking sockets, send() may not accept all bytes at once if the
+ * kernel's send buffer is full. When that happens we queue the unsent data in
+ * client->send_buf and register EPOLLOUT so handle_client_writeable drains the
+ * queue when space is available.
+ * 
+ * The engine never blocks waiting for a slow client, and never drops data
+ * silently.
+ */
+static int engine_send(int fd, const char *data, size_t len)
+{
+    struct client_info *client = conn_map_get(&conn_map, fd);
+    if (!client) return -1;
+
+    // If data is already queued, append to maintain ordering
+    if (client->send_len > 0)
+        return engine_queue_send(client, data, len);
+}
+
+static int engine_queue_send(struct client_info *client, const char *data,
+    size_t len)
+{
+    // Check if data fits in the send buffer
+    if (client->send_offset + client->send_len + len > MAX_SEND_BUFF) {
+        log_error("Send buffer overflow fd=%d, disconnecting",
+            client->socket_fd);
+        disconnect_client(client->socket_fd);
+        return -1;
+    }
+
+    memcpy(client->send_buf, client->send_offset + client->send_len, data,
+        len);
+    client->send_len += len;
+
+    // Register for EPOLLOUT to drain the queue when writeable
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+    ev.data.fd = client->socket_fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, client->socket_fd, &ev);
+    return 0;
+}
+
+/**
+ * engine_send_response - send ACK or ERROR with a status code.
+ * Builds the packet_header + response_payload and sends both.
+ */
+static void engine_send_response(int fd, enum packet_type type,
+    enum status_code code)
+{
+    struct packet_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = (uint8_t)type;
+    hdr.payload_len = htonl(sizeof(struct response_payload));
+    hdr.scope_id = htonl(0);
+    hdr.sender_id = htonl(0);
+    hdr.expires_at = htobe64(0);
+
+    struct response_payload rp;
+    rp.status_code = htonl((uint32_t)code);
+
+    engine_send(fd, (const char *)&hdr, sizeof(hdr));
+    engine_send(fd, (const char *)&rp, sizeof(rp));
+}
+
+/**
+ * disconnect_client - clean up a client connection completely.
+ * 
+ * Order matters:
+ * 1. Log before removing from maps (so we can log user_id)
+ * 2. Remove from scope_map so no messages are routed to this fd
+ * 3. Remove from conn_map so no code tries to look up this fd
+ * 4. Remove from epoll before closing (Linux removes automatically on close
+ *      but explicit removal is cleaner)
+ * 5. Close the socket
+ * 6. Return the client_info to the pool
+ */
+static void disconnect_client(int fd)
+{
+    struct client_info *client = conn_map_get(&conn_map, fd);
+    if (!client) {
+        close(fd);
+        return;
+    }
+
+    if (client->is_authenticated)
+        log_info("Disconnected fd=%d user_id=%u bytes_sent=%lu bytes_recv=%lu",
+            fd, client->user_id, (unsigned long)client->bytes_sent,
+            (unsigned long)client->bytes_recv);
+    else
+        log_info("Disconnected unauthenticated fd=%d", fd);
+
+    billing_log_disconnect(fd, client->user_id, client->bytes_sent,
+        client->bytes_recv);
+
+    scope_map_remove(&scope_map, fd);
+    conn_map_remove(&conn_map, fd);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    pool_free(client);
 }
 
 /**
@@ -360,6 +486,123 @@ static void handle_new_connections(void)
         log_info("Connected fd=%d ip=%s", client_fd,
             inet_ntoa(client_addr.sin_addr));
         billing_log_connect(client_fd, &client_addr);
+    }
+}
+
+/**
+ * handle_client_readable - read ALL available data from a client.
+ * 
+ * Edge-triggered: must read in a loop until EAGAIN.
+ * If we stop reading early, the data stays in the kernel buffer and epoll
+ * will NOT notify us again until NEW data arrives.
+ * The client would hang.
+ * 
+ * All data is appended to client->recv_buf. Complete packets are extracted
+ * and dispatched by process_recv_buffer().
+ */
+static void handle_client_readable(int fd)
+{
+    struct client_info *client = conn_map_get(&conn_map, fd);
+    if (!client) return;
+
+    while (1) {
+        size_t space = MAX_BUFF_SIZE - client->recv_len;
+        if (space == 0) {
+            log_error("Recv buffer full fd=%d, disconnecting", fd);
+            disconnect_client(fd);
+            return;
+        }
+
+        ssize_t n = recv(fd, client->recv_buf + client->recv_len, space, 0);
+
+        if (n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            int e = errno;
+            log_error("recv fd=%d: %s", fd, strerror(e));
+            disconnect_client(fd);
+            return;
+        }
+        if (n == 0) {
+            disconnect_client(fd);
+            return;
+        }
+
+        client->recv_len += (size_t)n;
+        client->bytes_recv += (uint64_t)n;
+    }
+
+    process_recv_buffer(client, fd);
+}
+
+/**
+ * process_recv_buffer - extract and dispatch complete packets.
+ * 
+ * The receive buffer may contain:
+ *      - Zero complete packets (partial header arrived, wait for more)
+ *      - One complete packet
+ *      - Multiple complete packets
+ * 
+ * Loop until no complete packets remain in the buffer. After extracting each
+ * packet, shift the buffer left with memmove.
+ */
+static void process_recv_buffer(struct client_info *client, int fd)
+{
+    while (client->recv_len >= sizeof(struct packet_header)) {
+        // Peek, don't consume yet
+        struct packet_header hdr;
+        memcpy(&hdr, client->recv_buf, sizeof(hdr));
+
+        // Convert from network byte order to host byte order
+        uint32_t payload_len = ntohl(hdr.payload_len);
+        uint32_t scope_id = ntohl(hdr.scope_id);
+        uint64_t expires_at = be64toh(hdr.expires_at);
+        uint8_t type = hdr.type;
+
+        if (payload_len > MAX_PAYLOAD) {
+            log_error("Oversized payload %u fd=%d, disconnecting", payload_len,
+                fd);
+            disconnect_client(fd);
+            return;
+        }
+
+        size_t total = sizeof(struct packet_header) + payload_len;
+        if (client->recv_len < total) break; // Wait for more data
+
+        // Complete packet available
+        char *payload = client->recv_buf + sizeof(struct packet_header);
+
+        // Server stamps sender_id, client cannot spoof identity
+        uint32_t sender_id = (uint32_t)fd;
+
+        dispatch_packet(client, fd, type, scope_id, sender_id, expires_at,
+            payload, payload_len);
+
+        // Remove processed packet from buffer
+        memmove(client->recv_buf, client->recv_buf + total,
+            client->recv_len - total);
+        client-> recv_len -= total;
+    }
+}
+
+/**
+ * dispatch_packet - route a complete packet to the correct handler.
+ * 
+ * This is the core routing logic of the engine.
+ * The engine knows packet types (JOIN, IDENTIFY, etc.) but never knows what
+ * the payload bytes mean - that is the application's job.
+ * 
+ * The security gate: all non-IDENTIFY packets require authentication.
+ * Unauthenticated packets receive an error response but the connection is kept
+ * open - the client can still auth.
+ */
+static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
+    uint32_t scope_id, uint32_t sender_id, uint64_t expires_at, char *payload,
+    uint32_t payload_len)
+{
+    if (type != TYPE_SYS_IDENTIFY && !client->is_authenticated) {
+        log_error("Unauthenticated packet type=%u fd=%d", type, fd);
+        engine_send_response(fd, TYPE_SYS_ERROR, STATUS_ERR_UNIDENTIFIED);
+        return // keep connection open, let them authenticate
     }
 }
 
