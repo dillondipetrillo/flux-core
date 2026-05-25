@@ -329,6 +329,21 @@ static int engine_send(int fd, const char *data, size_t len)
     // If data is already queued, append to maintain ordering
     if (client->send_len > 0)
         return engine_queue_send(client, data, len);
+
+    size_t n = send(fd, data, len, 0);
+    if (n == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return engine_queue_send(client, data, len);
+        disconnect_client(fd);
+        return -1;
+    }
+
+    client->bytes_sent += (uint64_t)n;
+
+    if ((size_t)n < len)
+        return engine_queue_send(client, data + n, len - (size_t)n);
+
+    return 0;
 }
 
 static int engine_queue_send(struct client_info *client, const char *data,
