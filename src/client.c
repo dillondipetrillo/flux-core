@@ -238,10 +238,12 @@ int main(int argc, char **argv)
 
             switch ((enum packet_type)r_header.type) {
                 case TYPE_SYS_ACK: {
-                    struct response_payload *rp =
-                        (struct response_payload *)r_payload;
-                    uint32_t code = ntohl(rp->status_code);
-                    (void)code;
+                    // Read and discard the 4-byte response payload
+                    struct response_payload rp;
+                    memcpy(&rp, r_payload, sizeof(rp));
+                    uint32_t code = ntohl(rp.status_code);
+                    printf("[ACK] status=%u\n", code);
+                    break;
 
                     if (pending_scope != 0) {
                         active_scope = pending_scope;
@@ -272,9 +274,11 @@ int main(int argc, char **argv)
                     break;
                 }
                 case TYPE_SYS_ERROR: {
-                    struct response_payload *rp = 
-                        (struct response_payload *)r_payload;
-                    uint32_t code = ntohl(rp->status_code);
+                    struct response_payload rp;
+                    memcpy(&rp, r_payload, sizeof(rp));
+                    uint32_t code = ntohl(rp.status_code);
+                    printf("[ERROR] status=%u\n", code);
+                    break;
 
                     pending_scope = 0;
                     pending_leave_scope = 0;
@@ -310,6 +314,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 case TYPE_SYS_PING:
+                    // Silently consume ping responses
                     break;
                 default:
                     r_payload[r_header.payload_len] = '\0';

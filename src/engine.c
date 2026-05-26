@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
@@ -8,6 +9,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "auth_hook.h"
 #include "config.h"
@@ -71,6 +73,14 @@ static void engine_send_response(int fd, enum packet_type type,
 static int engine_send(int fd, const char *data, size_t len);
 static int engine_queue_send(struct client_info *client, const char *data, 
     size_t len);
+static int client_in_scope(const struct client_info *client,
+    uint32_t scope_id);
+static int client_leave_scope(struct client_info *client, uint32_t scope_id);
+static int route_to_scope_map(int sender_fd, uint32_t scope_id,
+    uint32_t sender_id, uint8_t type, uint64_t expires_at, const char *payload,
+    uint32_t payload_len);
+static void handle_client_writable(int fd);
+static void perform_graceful_shutdown(void);
 
  /**
   * ===========================================================
@@ -268,7 +278,7 @@ void engine_run(void)
         }
 
         for (int i = 0; i < n; i++) {
-            int fd = events[i].data.id;
+            int fd = events[i].data.fd;
 
             if (fd == server_fd)
                 handle_new_connections();
@@ -278,8 +288,12 @@ void engine_run(void)
                 disconnect_client(fd);
             else if (events[i].events & EPOLLIN)
                 handle_client_readable(fd);
+            else if (events[i].events & EPOLLOUT)
+                handle_client_writable(fd);
         }
     }
+
+    perform_graceful_shutdown();
 }
 
 /**
@@ -330,7 +344,7 @@ static int engine_send(int fd, const char *data, size_t len)
     if (client->send_len > 0)
         return engine_queue_send(client, data, len);
 
-    size_t n = send(fd, data, len, 0);
+    ssize_t n = send(fd, data, len, 0);
     if (n == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return engine_queue_send(client, data, len);
@@ -357,7 +371,7 @@ static int engine_queue_send(struct client_info *client, const char *data,
         return -1;
     }
 
-    memcpy(client->send_buf, client->send_offset + client->send_len, data,
+    memcpy(client->send_buf + client->send_offset + client->send_len, data,
         len);
     client->send_len += len;
 
@@ -391,6 +405,26 @@ static void engine_send_response(int fd, enum packet_type type,
     engine_send(fd, (const char *)&rp, sizeof(rp));
 }
 
+static int client_in_scope(const struct client_info *client,
+    uint32_t scope_id)
+{
+    for (int i = 0; i < client->scope_count; i++)
+        if (client->scopes[i] == scope_id) return 1;
+    return 0;
+}
+
+static int client_leave_scope(struct client_info *client, uint32_t scope_id)
+{
+    for (int i = 0; i < client->scope_count; i++) {
+        if (client->scopes[i] == scope_id) {
+            // Swap with last element, decrement count, O(1) removal
+            client->scopes[i] = client->scopes[--client->scope_count];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /**
  * disconnect_client - clean up a client connection completely.
  * 
@@ -421,7 +455,10 @@ static void disconnect_client(int fd)
     billing_log_disconnect(fd, client->user_id, client->bytes_sent,
         client->bytes_recv);
 
-    scope_map_remove(&scope_map, fd);
+    // Clean up client from all joined scopes
+    for (int i = 0; i < client->scope_count; i++)
+        scope_map_remove(&scope_map, client->scopes[i], fd);
+
     conn_map_remove(&conn_map, fd);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
@@ -617,8 +654,177 @@ static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
     if (type != TYPE_SYS_IDENTIFY && !client->is_authenticated) {
         log_error("Unauthenticated packet type=%u fd=%d", type, fd);
         engine_send_response(fd, TYPE_SYS_ERROR, STATUS_ERR_UNIDENTIFIED);
-        return // keep connection open, let them authenticate
+        return; // keep connection open, let them authenticate
     }
+
+    switch ((enum packet_type)type) {
+        case TYPE_SYS_IDENTIFY: {
+            if (client->is_authenticated) {
+                engine_send_response(fd, TYPE_SYS_ERROR,
+                    STATUS_ERR_ALREADY_ID);
+                break;
+            }
+
+            struct auth_request req;
+            req.token = payload;
+            req.token_len = payload_len;
+            req.conn_fd = fd;
+
+            struct auth_result result = current_hook(req);
+
+            if (!result.valid) {
+                log_error("Auth rejected fd=%d", fd);
+                engine_send_response(fd, TYPE_SYS_ERROR,
+                    STATUS_ERR_AUTH_FAILED);
+                disconnect_client(fd);
+                break;
+            }
+
+            size_t tlen = payload_len < 255 ? payload_len : 255;
+            memcpy(client->session_token, payload, tlen);
+            client->session_token[tlen] = '\0';
+            client->is_authenticated = 1;
+            client->user_id = result.user_id;
+            client->client_id = (uint32_t)fd;
+
+            log_info("Authenticated fd=%d user_id=%d", fd, result.user_id);
+            engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
+            billing_log_auth(fd, result.user_id);
+            break;
+        }
+
+        case TYPE_SYS_JOIN: {
+            if (client_in_scope(client, scope_id)) {
+                engine_send_response(fd, TYPE_SYS_ERROR,
+                    STATUS_ERR_ALREADY_IN_ROOM);
+                break;
+            }
+            if (client->scope_count >= MAX_SCOPES) {
+                engine_send_response(fd, TYPE_SYS_ERROR,
+                    STATUS_ERR_SCOPES_FULL);
+                break;
+            }
+            client->scopes[client->scope_count++] = scope_id;
+            scope_map_add(&scope_map, scope_id, fd);
+            log_info("fd=%d joined scope=%u", fd, scope_id);
+            engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
+            break;
+        }
+
+        case TYPE_SYS_LEAVE: {
+            if (!client_leave_scope(client, scope_id)) {
+                engine_send_response(fd, TYPE_SYS_ERROR,
+                    STATUS_ERR_NOT_IN_ROOM);
+                break;
+            }
+            scope_map_remove(&scope_map, scope_id, fd);
+            log_info("fd=%d left scope=%u", fd, scope_id);
+            engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
+            break;
+        }
+
+        case TYPE_SYS_PING: {
+            struct packet_header pong;
+            memset(&pong, 0, sizeof(pong));
+            pong.type = (uint8_t)TYPE_SYS_PING;
+            pong.payload_len = htonl(0);
+            pong.scope_id = htonl(0);
+            pong.sender_id = htonl(0);
+            pong.expires_at = htobe64(0);
+            engine_send(fd, (const char *)&pong, sizeof(pong));
+            break;
+        }
+
+        default: {
+            // Application data - check TTL then route
+            if (expires_at != 0 && expires_at < (uint64_t)time(NULL)) {
+                log_info("TTL expired fd=%d scope=%u", fd, scope_id);
+                engine_send_response(fd, TYPE_SYS_ERROR, STATUS_ERR_EXPIRED);
+                break;
+            }
+            route_to_scope_map(fd, scope_id, sender_id, type, expires_at,
+                payload, payload_len);
+            break;
+        }
+    }
+    (void)sender_id; // used in route_to_scope_map, surpress warning
+}
+
+/**
+ * route_to_scope_map - send a packet to all subscribers of a scope.
+ * 
+ * Uses scope_map_get() for O(k) lookup where k = subscribers in scope.
+ * The header is converted to network byte order ONCE before the loop, not
+ * once per recipient.
+ */
+static int route_to_scope_map(int sender_fd, uint32_t scope_id,
+    uint32_t sender_id, uint8_t type, uint64_t expires_at, const char *payload,
+    uint32_t payload_len)
+{
+    int count = 0;
+    int *fds = scope_map_get(&scope_map, scope_id, &count);
+    if (!fds || count == 0) return 0;
+
+    // Build outgoing header once
+    struct packet_header out;
+    out.type = type;
+    out.payload_len = htonl(payload_len);
+    out.scope_id = htonl(scope_id);
+    out.sender_id = htonl(sender_id);
+    out.expires_at = htobe64(expires_at);
+
+    int routed = 0;
+    for (int i = 0; i < count; i++) {
+        if (fds[i] == sender_fd) continue; // never echo to sender
+        engine_send(fds[i], (const char *)&out, sizeof(out));
+        if (payload_len > 0)
+            engine_send(fds[i], payload, payload_len);
+        routed++;
+    }
+    return routed;
+}
+
+/**
+ * handle_client_writable - drain the outbound queue.
+ * 
+ * Called when EPOLLOUT fires - the kernel send buffer has space.
+ * We send as much of client->send_buf as possible.
+ * If we drain it completely, remove EPOLLOUT monitoring.
+ * If the buffer fills again (EAGAIN), leave EPOLLOUT registered.
+ */
+static void handle_client_writable(int fd)
+{
+    struct client_info *client = conn_map_get(&conn_map, fd);
+    if (!client || client->send_len == 0) {
+        // Nothing queued - stop watching for writability
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        return;
+    }
+
+    while (client->send_len > 0) {
+        ssize_t n = send(fd, client->send_buf + client->send_offset,
+            client->send_len, 0);
+
+        if (n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            disconnect_client(fd);
+            return;
+        }
+
+        client->bytes_sent += (uint64_t)n;
+        client->send_offset += (size_t)n;
+        client->send_len += (size_t)n;
+    }
+
+    // Queue drained - reset and stop watching writability
+    client->send_offset = 0;
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
 }
 
 /**
@@ -646,4 +852,26 @@ static void handle_health_check(void)
 
     send(fd, response, (size_t)n, 0);
     close(fd);
+}
+
+static void perform_graceful_shutdown(void)
+{
+    log_info("Graceful shutdown initiated");
+
+    auth_http_curl_cleanup();
+
+    if (server_fd != -1) {
+        close(server_fd);
+        server_fd = -1;
+    }
+    if (health_fd != -1) {
+        close(health_fd);
+        health_fd = -1;
+    }
+    if (epfd != -1) {
+        close(epfd);
+        epfd = -1;
+    }
+
+    log_info("Graceful shutdown complete");
 }
