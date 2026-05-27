@@ -186,8 +186,8 @@ int main(int argc, char **argv)
                     printf("You must /join a scope before sending "
                         "messsages.\n");
                 } else {
-                    send_packet(socketfd, TYPE_APP_REALTIME, active_scope,
-                        (uint64_t)time(NULL) - 1, input, strlen(input));
+                    send_packet(socketfd, TYPE_APP_REALTIME, active_scope, 0,
+                        input, strlen(input));
                 }
             }
         }
