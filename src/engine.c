@@ -49,6 +49,15 @@ static struct client_info pool[POOL_MAX];
 static struct client_info *free_list[POOL_MAX];
 static int free_count = 0;
 
+// Rate limit - epoll connections per IP    
+#define RATE_MAP_SIZE 256
+struct rate_entry {
+    uint32_t ip;
+    int count;
+    time_t window_start;
+};
+static struct rate_entry rate_map[RATE_MAP_SIZE];
+
 /**
  * ===========================================================
  * FORWARD DECLARATIONS
@@ -81,6 +90,7 @@ static int route_to_scope_map(int sender_fd, uint32_t scope_id,
     uint32_t payload_len);
 static void handle_client_writable(int fd);
 static void perform_graceful_shutdown(void);
+static int rate_limit_check(struct sockaddr_in *addr);
 
  /**
   * ===========================================================
@@ -482,6 +492,7 @@ static void setup_client_socket(int fd)
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    // TCP keepalive - detect dead connections
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &cfg->tcp_keepalive_idle,
         sizeof(int));
@@ -516,7 +527,11 @@ static void handle_new_connections(void)
             break;
         }
 
-        // TODO: add rate limiting
+        // Rate limiting - reject connections over the per-IP limit
+        if (!rate_limit_check(&client_addr)) {
+            close(client_fd);
+            continue;
+        }
 
         setup_client_socket(client_fd);
 
@@ -874,4 +889,40 @@ static void perform_graceful_shutdown(void)
     }
 
     log_info("Graceful shutdown complete");
+}
+
+/**
+ * rate_limit_checl - reject connections from IPs exceeding the limit.
+ * 
+ * Returns 1 if the connection should be allowed.
+ * Returns 0 if the connection should be rejected.
+ */
+static int rate_limit_check(struct sockaddr_in *addr)
+{
+    uint32_t ip = addr->sin_addr.s_addr;
+    int slot = (int)(ip % RATE_MAP_SIZE);
+    time_t now = time(NULL);
+
+    // If the slot holds a different IP, reset it
+    if (rate_map[slot].ip != ip) {
+        rate_map[slot].ip = ip;
+        rate_map[slot].count = 0;
+        rate_map[slot].window_start = now;
+    }
+
+    // If the time window has passed, reset the counter
+    if (now > rate_map[slot].window_start) {
+        rate_map[slot].count = 0;
+        rate_map[slot].window_start = now;
+    }
+
+    rate_map[slot].count++;
+
+    if (rate_map[slot].count > cfg->conn_rate_limit) {
+        log_error("Rate limit exceeded ip=%s count=%d limit=%d",
+            inet_ntoa(addr->sin_addr), rate_map[slot].count,
+            cfg->conn_rate_limit);
+        return 0;
+    }
+    return 1;
 }
