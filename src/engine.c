@@ -903,17 +903,21 @@ static int rate_limit_check(struct sockaddr_in *addr)
     int slot = (int)(ip % RATE_MAP_SIZE);
     time_t now = time(NULL);
 
-    // If the slot holds a different IP, reset it
-    if (rate_map[slot].ip != ip) {
+    // Only reset if window expired or if this IP owns the slot
+    // Never reset an active counter just because a different IP arrived
+    if (rate_map[slot].ip == ip) {
+        // Same IP, check window
+        if (now > rate_map[slot].window_start) {
+            rate_map[slot].count = 0;
+            rate_map[slot].window_start = now;
+        }
+    } else if (now > rate_map[slot].window_start) {
+        // Different IP but window expired, safe to take slot
         rate_map[slot].ip = ip;
         rate_map[slot].count = 0;
         rate_map[slot].window_start = now;
-    }
-
-    // If the time window has passed, reset the counter
-    if (now > rate_map[slot].window_start) {
-        rate_map[slot].count = 0;
-        rate_map[slot].window_start = now;
+    } else {
+        return 1;
     }
 
     rate_map[slot].count++;
