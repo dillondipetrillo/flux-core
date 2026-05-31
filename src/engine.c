@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,14 +50,29 @@ static struct client_info pool[POOL_MAX];
 static struct client_info *free_list[POOL_MAX];
 static int free_count = 0;
 
-// Rate limit - epoll connections per IP    
+/**
+ * Rate limiter - 4-way associative hash map
+ * 
+ * RATE_MAP_SIZE buckets, each holding 4 slots.
+ * An IP is hashed to a bucket. All 4 slots in the bucket are searched for a
+ * matching IP. If not found, an empty slot is used, or the slot with the
+ * oldest window_start is evicted.
+ */
 #define RATE_MAP_SIZE 256
-struct rate_entry {
+#define RATE_MAP_WAYS 4
+
+struct rate_slot {
     uint32_t ip;
     int count;
     time_t window_start;
+    int in_use;
 };
-static struct rate_entry rate_map[RATE_MAP_SIZE];
+
+struct rate_bucket {
+    struct rate_slot slots[RATE_MAP_WAYS];
+};
+
+static struct rate_bucket rate_map[RATE_MAP_SIZE];
 
 /**
  * ===========================================================
@@ -537,7 +553,9 @@ static void handle_new_connections(void)
 
         struct client_info *client = pool_alloc();
         if (!client) {
-            log_error("Pool exhausted, rejecting fd=%d", client_fd);
+            log_error("Memory pool exhausted (max=%d), rejecting fd=%d. "
+                "Increase ENGINE_MAX_CLIENTS to allow more connections.",
+                cfg->max_clients, client_fd);
             close(client_fd);
             continue;
         }
@@ -892,41 +910,68 @@ static void perform_graceful_shutdown(void)
 }
 
 /**
- * rate_limit_checl - reject connections from IPs exceeding the limit.
+ * rate_limit_check - 4-way associative per-IP rate limiter.
  * 
  * Returns 1 if the connection should be allowed.
- * Returns 0 if the connection should be rejected.
+ * Returns 0 if the connection should be rejected (over limit).
+ * 
+ * Algorithm:
+ *      1. Hash IP to a bucket (bitwise AND, O(1))
+ *      2. Search 4 slots for matching IP
+ *      3. If found: check/reset window, increment count, apply limit
+ *      4. If not found: find empty slot or evict oldest, init
  */
 static int rate_limit_check(struct sockaddr_in *addr)
 {
     uint32_t ip = addr->sin_addr.s_addr;
-    int slot = (int)(ip % RATE_MAP_SIZE);
+    int bucket = (int)(ip & (RATE_MAP_SIZE - 1));
     time_t now = time(NULL);
 
-    // Only reset if window expired or if this IP owns the slot
-    // Never reset an active counter just because a different IP arrived
-    if (rate_map[slot].ip == ip) {
-        // Same IP, check window
-        if (now > rate_map[slot].window_start) {
-            rate_map[slot].count = 0;
-            rate_map[slot].window_start = now;
+    struct rate_bucket *b = &rate_map[bucket];
+
+    // Search for an existing slot for this IP
+    for (int i = 0; i < RATE_MAP_WAYS; i++) {
+        if (!b->slots[i].in_use) continue;
+        if (b->slots[i].ip != ip) continue;
+
+        // Found IP's slot
+        if (now > b->slots[i].window_start) {
+            // Time window expired, reset counter for new window
+            b->slots[i].count = 0;
+            b->slots[i].window_start = now;
         }
-    } else if (now > rate_map[slot].window_start) {
-        // Different IP but window expired, safe to take slot
-        rate_map[slot].ip = ip;
-        rate_map[slot].count = 0;
-        rate_map[slot].window_start = now;
-    } else {
+
+        b->slots[i].count++;
+
+        if (b->slots[i].count > cfg->conn_rate_limit) {
+            log_error("Rate limit exceeded ip=%s count=%d limit=%d",
+                inet_ntoa(addr->sin_addr), b->slots[i].count,
+                cfg->conn_rate_limit);
+            return 0;
+        }
         return 1;
     }
 
-    rate_map[slot].count++;
+    // IP has no slot yet, find empty slot or one with oldest window_start
+    int target = -1;
+    time_t oldest_window = (time_t)LONG_MAX;
 
-    if (rate_map[slot].count > cfg->conn_rate_limit) {
-        log_error("Rate limit exceeded ip=%s count=%d limit=%d",
-            inet_ntoa(addr->sin_addr), rate_map[slot].count,
-            cfg->conn_rate_limit);
-        return 0;
+    for (int i = 0; i < RATE_MAP_WAYS; i++) {
+        if (!b->slots[i].in_use) {
+            target = i;
+            break; // Choose empty slot over eviction
+        }
+        if (b->slots[i].window_start < oldest_window) {
+            oldest_window = b->slots[i].window_start;
+            target = i;
+        }
     }
+
+    // Init slot for this IP
+    b->slots[target].ip = ip;
+    b->slots[target].count = 1;
+    b->slots[target].window_start = now;
+    b->slots[target].in_use = 1;
+
     return 1;
 }

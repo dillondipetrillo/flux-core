@@ -13,6 +13,8 @@ ENGINE_SRCS = src/main.c \
 
 TEST_AUTH = tests/test_auth_hook.c src/auth_hook.c src/logger.c
 
+TEST_RATE_LIMIT = tests/test_rate_limit.c
+
 all: server client
 
 server: $(ENGINE_SRCS)
@@ -27,6 +29,14 @@ client: src/client.c src/config.c src/utils.c src/logger.c
 
 tests/run_auth: $(TEST_AUTH)
 	$(CC) $(CFLAGS) -o $@ $(TEST_AUTH) $(LDFLAGS)
+
+tests/run_rate_limit: $(TEST_RATE_LIMIT)
+	$(CC) $(CFLAGS) -o $@ $(TEST_RATE_LIMIT)
+
+test: tests/run_auth tests/run_rate_limit
+	./tests/run_auth
+	./tests/run_rate_limit
+	@echo "All unit tests passed."
 
 sanitize: $(ENGINE_SRCS)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -o server_san \
