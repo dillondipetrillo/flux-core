@@ -3,57 +3,103 @@
 #include "conn_map.h"
 
 /**
- * conn_map.c - Minimal working connection hash map.
+ * conn_map.c - Connection hash map.
  * 
- * Maps file descriptor -> client_info pointer.
- * Uses simple modulo hash: fd % CONN_MAP_BUCKETS.
- * Works correctly for small test fd numbers (no collisions in practice).
+ * Maps file descriptor (int) -> client_info pointer.
+ * 
+ * Hash: fd & (CONN_MAP_BUCKETS - 1)
+ * Collision resolution: linear probing with backward-shift deletion.
  */
-
-// Static backing storage - not part of the conn_map struct
-static struct conn_entry _buckets[CONN_MAP_BUCKETS];
 
 void conn_map_init(struct conn_map *map)
 {
-    (void)map;
-    memset(_buckets, 0, sizeof(_buckets));
+    memset(map, 0, sizeof(*map));
+    for (int i = 0; i < CONN_MAP_BUCKETS; i++)
+        map->buckets[i].fd = -1;
+}
+
+static inline int conn_hash(int fd)
+{
+    return fd & (CONN_MAP_BUCKETS - 1);
+}
+
+static int find_bucket(struct conn_map *map, int fd, int create)
+{
+    int start = conn_hash(fd);
+    int i = start;
+    int probes = 0;
+
+    do {
+        if (!map->buckets[i].in_use) {
+            if (!create) return -1;
+            map->buckets[i].in_use = 1;
+            map->buckets[i].fd = fd;
+            map->buckets[i].client = NULL;
+            return i;
+        }
+        if (map->buckets[i].fd == fd) return i;
+        i = (i + 1) & (CONN_MAP_BUCKETS - 1);
+        probes++;
+    } while (i != start && probes < CONN_MAP_BUCKETS);
+
+    return -1;
+}
+
+static void fix_chain(struct conn_map *map, int freed)
+{
+    int i = (freed + 1) & (CONN_MAP_BUCKETS - 1);
+
+    while (map->buckets[i].in_use) {
+        int natural = conn_hash(map->buckets[i].fd);
+
+        int should_move;
+        if (i > freed)
+            should_move = (natural <= freed || natural > i);
+        else
+            should_move = (natural <= freed && natural > i);
+
+        if (should_move) {
+            map->buckets[freed] = map->buckets[i];
+            map->buckets[i].in_use = 0;
+            map->buckets[i].fd = -1;
+            map->buckets[i].client = NULL;
+            freed = i;
+        }
+
+        i = (i + 1) & (CONN_MAP_BUCKETS - 1);
+        if (i == freed) break;
+    }
 }
 
 int conn_map_add(struct conn_map *map, int fd, struct client_info *client)
 {
-    (void)map;
-    int slot = fd % CONN_MAP_BUCKETS;
-    _buckets[slot].fd = fd;
-    _buckets[slot].client = client;
-    _buckets[slot].in_use = 1;
+    int b = find_bucket(map, fd, 1);
+    if (b == -1) return -1;
+    map->buckets[b].client = client;
     return 0;
 }
 
 struct client_info *conn_map_get(struct conn_map *map, int fd)
 {
-    (void)map;
-    int slot = fd % CONN_MAP_BUCKETS;
-    if (_buckets[slot].in_use && _buckets[slot].fd == fd)
-        return _buckets[slot].client;
-    return NULL;
+    int b = find_bucket(map, fd, 0);
+    if (b == -1) return NULL;
+    return map->buckets[b].client;
 }
 
 void conn_map_remove(struct conn_map *map, int fd)
 {
-    (void)map;
-    int slot = fd % CONN_MAP_BUCKETS;
-    if (_buckets[slot].fd == fd) {
-        _buckets[slot].in_use = 0;
-        _buckets[slot].fd = -1;
-        _buckets[slot].client = NULL;
-    }
+    int b = find_bucket(map, fd, 0);
+    if (b == -1) return;
+    map->buckets[b].in_use = 0;
+    map->buckets[b].fd = -1;
+    map->buckets[b].client = NULL;
+    fix_chain(map, b);
 }
 
 int conn_map_count(struct conn_map *map)
 {
-    (void)map;
     int count = 0;
-    for (int i = 0; i <CONN_MAP_BUCKETS; i++)
-        if (_buckets[i].in_use) count++;
+    for (int i = 0; i < CONN_MAP_BUCKETS; i++)
+        if (map->buckets[i].in_use) count++;
     return count;
 }
