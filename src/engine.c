@@ -875,12 +875,16 @@ static void handle_health_check(void)
     int fd = accept(health_fd, NULL, NULL);
     if (fd == -1) return;
 
-    char response[256];
+    char response[512];
     int n = snprintf(response, sizeof(response),
         "STATUS OK\r\n"
         "CONNECTIONS %d\r\n"
+        "POOL_FREE %d\r\n"
+        "POOL_MAX %d\r\n"
         "UPTIME %lu\r\n",
         conn_map_count(&conn_map),
+        free_count,
+        cfg->max_clients,
         (unsigned long)(time(NULL) - start_time));
 
     send(fd, response, (size_t)n, 0);

@@ -12,11 +12,9 @@ ENGINE_SRCS = src/main.c \
 	src/utils.c
 
 TEST_AUTH = tests/test_auth_hook.c src/auth_hook.c src/logger.c
-
 TEST_CONN_MAP = tests/test_conn_map.c src/conn_map.c
-
+TEST_PROTOCOL = tests/test_protocol.c
 TEST_RATE_LIMIT = tests/test_rate_limit.c
-
 TEST_SCOPE_MAP = tests/test_scope_map.c src/scope_map.c
 
 all: server client
@@ -37,15 +35,20 @@ tests/run_auth: $(TEST_AUTH)
 tests/run_conn_map: $(TEST_CONN_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_CONN_MAP)
 
+tests/run_protocol: $(TEST_PROTOCOL)
+	$(CC) $(CFLAGS) -o $@ $(TEST_PROTOCOL)
+
 tests/run_rate_limit: $(TEST_RATE_LIMIT)
 	$(CC) $(CFLAGS) -o $@ $(TEST_RATE_LIMIT)
 
 tests/run_scope_map: $(TEST_SCOPE_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SCOPE_MAP)
 
-test: tests/run_auth tests/run_rate_limit tests/run_scope_map
+test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
+		tests/run_conn_map tests/run_protocol
 	./tests/run_auth
 	./tests/run_conn_map
+	./tests/run_protocol
 	./tests/run_rate_limit
 	./tests/run_scope_map
 	@echo "All unit tests passed."

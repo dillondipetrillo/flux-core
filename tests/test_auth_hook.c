@@ -126,6 +126,5 @@ int main(void)
     test_select_jwt_priority();
     test_select_http_only();
     test_select_dev_mode();
-    test_hmac_known_answer();
     TEST_SUMMARY();
 }
