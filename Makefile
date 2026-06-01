@@ -15,6 +15,8 @@ TEST_AUTH = tests/test_auth_hook.c src/auth_hook.c src/logger.c
 
 TEST_RATE_LIMIT = tests/test_rate_limit.c
 
+TEST_SCOPE_MAP = tests/test_scope_map.c src/scope_map.c
+
 all: server client
 
 server: $(ENGINE_SRCS)
@@ -33,9 +35,13 @@ tests/run_auth: $(TEST_AUTH)
 tests/run_rate_limit: $(TEST_RATE_LIMIT)
 	$(CC) $(CFLAGS) -o $@ $(TEST_RATE_LIMIT)
 
-test: tests/run_auth tests/run_rate_limit
+tests/run_scope_map: $(TEST_SCOPE_MAP)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SCOPE_MAP)
+
+test: tests/run_auth tests/run_rate_limit tests/run_scope_map
 	./tests/run_auth
 	./tests/run_rate_limit
+	./tests/run_scope_map
 	@echo "All unit tests passed."
 
 sanitize: $(ENGINE_SRCS)
