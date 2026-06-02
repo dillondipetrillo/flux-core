@@ -11,8 +11,19 @@
  * All internal state and helper functions are static in engine.c.
  */
 
+/**
+ * engine_prefork_init - one-time initialization before forking.
+ * Call once in the parent process before fork().
+ * Initializes libcurl and logs configuration.
+ * Returns 0 on success, -1 on failure.
+ */
+int engine_prefork_init(struct engine_config *config);
+
  /**
-  * Initialize the engine. Must be called before set_auth_hook and run.
+  * engine_init - per-worker initialization.
+  * Call once in each worker process after fork().
+  * Creates server socket, health socket, epoll instance, data structures,
+  * memory pool, and registers signal handlers.
   * Returns 0 on success, -1 on failure.
   */
 int engine_init(struct engine_config *config);

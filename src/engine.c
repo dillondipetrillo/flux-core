@@ -148,6 +148,23 @@ void engine_stop(void)
     engine_running = 0;
 }
 
+int engine_prefork_init(struct engine_config *config)
+{
+    cfg = config;
+
+    /**
+     * curl_global_init must be called before any fork().
+     * After fork, each child inherits the initialized state.
+     * Calling it after fork causes undefined behavior because curl may
+     * initialize global state that uses shared memory that cannot be safely
+     * duplicated across processes.
+     */
+    auth_http_curl_init();
+
+    log_info("Pre-fork initialization complete");
+    return 0;
+}
+
 int engine_init (struct engine_config *config)
 {
     cfg = config;
@@ -166,7 +183,7 @@ int engine_init (struct engine_config *config)
     signal(SIGTERM, handle_shutdown);
     signal(SIGINT, handle_shutdown);
     signal(SIGHUP, handle_sighup);
-    log_info("Signal handlers registered");
+    log_info("Signal handlers registered (worker pid=%d)", (int)getpid());
 
     
     // Raise soft file descriptor to the hard limit maximum
@@ -181,14 +198,8 @@ int engine_init (struct engine_config *config)
         // Read back actual result, OS may cap it
         getrlimit(RLIMIT_NOFILE, &rl);
     }
-    log_info("File descriptor limit: %lu", (unsigned long)rl.rlim_cur);
-
-    /**
-     * libcurl Init.
-     * Must be called before any fork() because curl_global_init is not
-     * safe to call after forking.
-     */
-    auth_http_curl_init();
+    log_info("Worker pid=%d fd limit: %lu",
+        (int)getpid(), (unsigned long)rl.rlim_cur);
 
     // Data structures
     scope_map_init(&scope_map);
@@ -204,6 +215,13 @@ int engine_init (struct engine_config *config)
     }
     free_count = pool_size;
     log_info("Memory pool: %d client slots pre-allocated", pool_size);
+
+    // Epoll instance
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        log_error("epoll_create1: %s", strerror(errno));
+        return -1;
+    }
 
     // Server socket
     server_fd = socket(PF_INET, SOCK_STREAM, 0);
@@ -232,36 +250,52 @@ int engine_init (struct engine_config *config)
         return -1;
     }
 
-    // Health check socket
-    health_fd = socket(PF_INET, SOCK_STREAM, 0);
-    if (health_fd != -1) {
-        setsockopt(health_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        set_nonblocking(health_fd);
-        addr.sin_port = htons((uint16_t)config->health_port);
-        if (bind(health_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1 ||
-            listen(health_fd, 16) == -1)
-        {
-            log_error("health socket setup failed: %s", strerror(errno));
-            health_fd = -1;
-        }
-    }
-
-    // Epoll instance
-    epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd == -1) {
-        log_error("epoll_create1: %s", strerror(errno));
-        return -1;
-    }
-
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = server_fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+        log_error("epoll_ctl ADD server_fd failed: %s", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
 
+    // Health check socket
+    health_fd = socket(PF_INET, SOCK_STREAM, 0);
     if (health_fd != -1) {
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.fd = health_fd;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, health_fd, &ev);
+        int hopt = 1;
+        setsockopt(health_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(hopt));
+        setsockopt(health_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(hopt));
+        set_nonblocking(health_fd);
+
+        struct sockaddr_in haddr;
+        memset(&haddr, 0, sizeof(haddr));
+        haddr.sin_family = AF_INET;
+        haddr.sin_port = htons((uint16_t)config->health_port);
+        haddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+        if (bind(health_fd, (struct sockaddr *)&haddr, sizeof(haddr)) == -1 ||
+            listen(health_fd, 16) == -1)
+        {
+            log_error("Health socket failed to bind port %d: %s",
+                config->health_port, strerror(errno));
+            close(health_fd);
+            health_fd = -1;
+            log_error("Health check DISABLED - "
+                "load balancer checks will fail");
+        } else {
+            log_info("Health check ENABLED on port %d (worker pid=%d)",
+                config->health_port, (int)getpid());
+
+            struct epoll_event hev;
+            hev.events = EPOLLIN | EPOLLET;
+            hev.data.fd = health_fd;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, health_fd, &hev) == -1) {
+                log_error("epoll_ctl ADD health_fd failed: %s",
+                    strerror(errno));
+                close(health_fd);
+                health_fd = -1;
+            }
+        }
     }
 
     log_info("Engine listening on port %d", config->port);
