@@ -107,6 +107,11 @@ static int route_to_scope_map(int sender_fd, uint32_t scope_id,
 static void handle_client_writable(int fd);
 static void perform_graceful_shutdown(void);
 static int rate_limit_check(struct sockaddr_in *addr);
+static void sleep_interruptible(int seconds);
+static void shutdown_callback(int fd, struct client_info *client,
+    void *userdata);
+static void cleanup_callback(int fd, struct client_info *client,
+    void *userdata);
 
  /**
   * ===========================================================
@@ -925,16 +930,96 @@ static void handle_health_check(void)
     close(fd);
 }
 
+/**
+ * shutdown_ctx - context passed to the graceful shutdown callback.
+ * Tracks how many clients were notified successfully vs attempted.
+ */
+struct shutdown_ctx {
+    struct packet_header *hdr;
+    int attempted;
+    int notified;
+};
+
+/**
+ * shutdown_callback - called once per active connection during shutdown.
+ * 
+ * Sends TYPE_SYS_SHUTDOWN to authenticated clients using MSG_DONTWAIT.
+ * MSG_DONTWAIT: if the kernel send buffer is full, skip this client rather
+ * than blocking. During shutdown we cannot afford to stall on one slow client,
+ * the whole process needs to exit cleanly.
+ * 
+ * Unauthenticated clients are skipped - they have not completed the handshake
+ * and cannot meaningfully interpret a shutdown packet. They will receive a
+ * broken pipe when their fd is closed.
+ * 
+ * Note: do NOT call conn_map_remove or disconnect_client from this callback.
+ * conn_map_foreach must notify the map during iteration. Cleanup happens in
+ * the second pass in perform_graceful_shutdown.
+ */
+static void shutdown_callback(int fd, struct client_info *client,
+    void *userdata)
+{
+    struct shutdown_ctx *ctx = (struct shutdown_ctx *)userdata;
+
+    if (!client) return;
+
+    ctx->attempted++;
+
+    if (!client->is_authenticated) return;
+
+    ssize_t sent = send(fd, ctx->hdr, sizeof(struct packet_header),
+        MSG_DONTWAIT);
+
+    if (sent == (ssize_t)sizeof(struct packet_header))
+        ctx->notified++;
+    else {
+        /**
+         * Send failed, client's buffer is full or socket is broken. Client
+         * will get a broken pipe when we close the fd. This is acceptable,
+         * we made a best-effort notification.
+         */
+        log_info("Shutdown notification not delivered to fd=%d "
+            "(send returned %zd)", fd, sent);
+    }
+}
+
+// cleanup_ctx - context for the force-close pass
+struct cleanup_ctx {
+    int closed;
+};
+
+/**
+ * cleanup_callback - force-close one client connection.
+ * 
+ * Called for every active connection after the 2-second shutdown window.
+ * Removes the fd from epoll before closing - explicit DEL before close is
+ * best-practice even though Linux auto-removes on close.
+ * 
+ * Does NOT call disconnect_client() because that function calls
+ * conn_map_remove() which modifies the map during iteration. Raw close is
+ * correct here, we are shutting down entirely, not maintaining any map state
+ * after this point.
+ */
+static void cleanup_callback(int fd, struct client_info *client,
+    void *userdata)
+{
+    struct cleanup_ctx *ctx = (struct cleanup_ctx *)userdata;
+    (void)client; // not needed for force-close
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    ctx->closed++;
+}
+
 static void perform_graceful_shutdown(void)
 {
-    int total = conn_map_count(&conn_map);
-    int notified = 0;
-
-    log_info("Graceful shutdown: notifying %d connected client(s)", total);
+    
+    log_info("Graceful shutdown initiated (worker pid=%d)", (int)getpid());
 
     /**
      * Build the TYPE_SYS_SHUTDOWN packet once.
-     * Sending it to every authenticated client.
+     * All fields in network byte order.
+     * Zero payload_len, this packet carries no payload.
      */
     struct packet_header shutdown_hdr;
     memset(&shutdown_hdr, 0, sizeof(shutdown_hdr));
@@ -945,60 +1030,55 @@ static void perform_graceful_shutdown(void)
     shutdown_hdr.expires_at = htobe64(0);
 
     /**
-     * Iterate the conn_map bucket array directly.
-     * The event loop has exited - no concurrent modifications.
-     * We cannot use conn_map_get here because we are iterating all entries,
-     * not looking up a specific fd.
-     */
-    for (int i = 0; i < CONN_MAP_BUCKETS; i++) {
-        if (!conn_map.buckets[i].in_use) continue;
-
-        struct client_info *client = conn_map.buckets[i].client;
-        if (!client) continue;
-
-        if (client->is_authenticated) {
-            /**
-             * MSG_DONTWAIT: if the socket's send buffer is full, skip this
-             * client rather than blocking. During shutdown we cannot afford
-             * to stall on a single slow client. The client will get a broken
-             * pipe instead - acceptable.
-             */
-            send(conn_map.buckets[i].fd, &shutdown_hdr, sizeof(shutdown_hdr),
-                MSG_DONTWAIT);
-            notified++;
-        }
-    }
-
-    log_info("Shutdown packet sent to %d/%d client(s)", notified, total);
-
-    /**
-     * Wait 2 seconds for clients to receive the shutdown packet and begin
-     * reconnecting. This window prevents clients from experiencing an
-     * unexpected broken pipe.
+     * Pass 1: send TYPE_SYS_SHUTDOWN to all authenticated clients.
      * 
-     * Note: this blocks the process for 2 seconds. This is intentional - the
-     * event loop has already stopped, so no client data is being dropped
-     * during this wait.
+     * Use conn_map_foreach, no direct bucket access.
+     * conn_map's internals stay private to conn_map.c.
      */
-    if (notified > 0) {
-        log_info("Waiting 2 seconds for clients to receive shutdown...");
-        sleep(2);
+    struct shutdown_ctx sctx;
+    sctx.hdr = &shutdown_hdr;
+    sctx.attempted = 0;
+    sctx.notified = 0;
+
+    conn_map_foreach(&conn_map, shutdown_callback, &sctx);
+
+    log_info("Shutdown notification: sent to %d/%d client(s) "
+        "(%d unauthenticated skipped)", sctx.notified, sctx.attempted,
+        sctx.attempted - sctx.notified);
+
+    /**
+     * Wait for clients to receive the shutdown notification.
+     * 
+     * This window is for NOTIFICATION DELIVERY, not data draining. Clients
+     * who receive TYPE_SYS_SHUTDOWN will start reconnecting. Clients who do
+     * not receive it (full buffer, broken socket) will get a broken pipe
+     * when we close their fd below - that is acceptable.
+     * 
+     * Use sleep_interruptible to guarantee the full window even if signals
+     * arrive (e.g., a second SIGTERM from an impatient orchestrator).
+     */
+    if (sctx.notified > 0) {
+        log_info("Waiting 2 seconds for shutdown notifications to deliver...");
+        sleep_interruptible(2);
     }
 
     /**
-     * Force-close all remaining client connections.
-     * After this point any pending data is discarded by the OS.
+     * Pass 2: force-close remaining client connections.
+     * 
+     * Calls epoll_ctl(EPOLL_CTL_DEL) before close() for each fd. This is
+     * explicit and correct even though Linux auto-removes closed fds from
+     * epoll.
+     * 
+     * Does NOT use disconnect_client() because that modifies conn_map during
+     * iteration. Here we are shutting down entirely, we do not need to
+     * maintain conn_map state after this loop.
      */
-    int closed = 0;
-    for (int i = 0; i < CONN_MAP_BUCKETS; i++) {
-        if (!conn_map.buckets[i].in_use) continue;
-        int fd = conn_map.buckets[i].fd;
-        if (fd >= 0) {
-            close(fd);
-            closed++;
-        }
-    }
-    log_info("Force-closed %d connection(s)", closed);
+    struct cleanup_ctx cctx;
+    cctx.closed = 0;
+
+    conn_map_foreach(&conn_map, cleanup_callback, &cctx);
+
+    log_info("Force-closed %d client connection(s)", cctx.closed);
 
     // Close engine sockets and epoll
     if (server_fd != -1) {
@@ -1085,4 +1165,35 @@ static int rate_limit_check(struct sockaddr_in *addr)
     b->slots[target].in_use = 1;
 
     return 1;
+}
+
+/**
+ * sleep_interruptible - sleep for the specified seconds, resuming
+ * automatically if interrupted by a signal.
+ * 
+ * Standard sleep() returns early when a signal arrives and does not resume.
+ * In production, signals may arrive during the shutdown window (e.g., a
+ * second SIGTERM from an orchestrator that is impatient). This function
+ * guarantees the full sleep duration regardless of signal interruptions.
+ * 
+ * Uses nanosleep() which provides the remaining time on EINTR, allowing the
+ * loop to continue from where it was interrupted.
+ */
+static void sleep_interruptible(int seconds)
+{
+    struct timespec remaining;
+    remaining.tv_sec = seconds;
+    remaining.tv_nsec = 0;
+
+    while (remaining.tv_sec > 0 || remaining.tv_nsec > 0) {
+        struct timespec interrupted;
+        if (nanosleep(&remaining, &interrupted) == 0)
+            break; // completed full sleep without interruption
+        if (errno == EINTR) {
+            // signal interrupted - continue with remaining time
+            remaining = interrupted;
+            continue;
+        }
+        break; // other error - stop sleeping
+    }
 }

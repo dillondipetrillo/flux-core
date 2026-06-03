@@ -103,3 +103,29 @@ int conn_map_count(struct conn_map *map)
         if (map->buckets[i].in_use) count++;
     return count;
 }
+
+/**
+ * conn_map_foreach - iterate all active connections.
+ * 
+ * Calls callback(fd, client, userdata) for every active entry in the map. The
+ * callback must not add or remove entries from the map during iteration -
+ * doing so causes undefined behavior because the underlying array may shift
+ * during backward-shift deletion.
+ * 
+ * userdata: arbitrary pointer passed through to the callback.
+ * Use it to pass context the callback needs (counters, config, etc.)
+ * 
+ * This function is the only correct way for external code to iterate all
+ * connections. Direct access to conn_map.buckets is forbidden outside of
+ * conn_map.c
+ */
+void conn_map_foreach(struct conn_map *map,
+    void (*callback)(int fd, struct client_info *client, void *userdata),
+    void *userdata)
+{
+    for (int i = 0; i < CONN_MAP_BUCKETS; i++) {
+        if (!map->buckets[i].in_use) continue;
+        if (map->buckets[i].fd < 0) continue;
+        callback(map->buckets[i].fd, map->buckets[i].client, userdata);
+    }
+}

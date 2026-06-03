@@ -29,5 +29,8 @@ int conn_map_add(struct conn_map *map, int fd, struct client_info *client);
 struct client_info *conn_map_get(struct conn_map *map, int fd);
 void conn_map_remove(struct conn_map *map, int fd);
 int conn_map_count(struct conn_map *map);
+void conn_map_foreach(struct conn_map *map,
+    void (*callback)(int fd, struct client_info *client, void *userdata),
+    void *userdata);
 
 #endif
