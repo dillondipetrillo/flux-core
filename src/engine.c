@@ -927,10 +927,80 @@ static void handle_health_check(void)
 
 static void perform_graceful_shutdown(void)
 {
-    log_info("Graceful shutdown initiated");
+    int total = conn_map_count(&conn_map);
+    int notified = 0;
 
-    auth_http_curl_cleanup();
+    log_info("Graceful shutdown: notifying %d connected client(s)", total);
 
+    /**
+     * Build the TYPE_SYS_SHUTDOWN packet once.
+     * Sending it to every authenticated client.
+     */
+    struct packet_header shutdown_hdr;
+    memset(&shutdown_hdr, 0, sizeof(shutdown_hdr));
+    shutdown_hdr.type = (uint8_t)TYPE_SYS_SHUTDOWN;
+    shutdown_hdr.payload_len = htonl(0);
+    shutdown_hdr.scope_id = htonl(0);
+    shutdown_hdr.sender_id = htonl(0);
+    shutdown_hdr.expires_at = htobe64(0);
+
+    /**
+     * Iterate the conn_map bucket array directly.
+     * The event loop has exited - no concurrent modifications.
+     * We cannot use conn_map_get here because we are iterating all entries,
+     * not looking up a specific fd.
+     */
+    for (int i = 0; i < CONN_MAP_BUCKETS; i++) {
+        if (!conn_map.buckets[i].in_use) continue;
+
+        struct client_info *client = conn_map.buckets[i].client;
+        if (!client) continue;
+
+        if (client->is_authenticated) {
+            /**
+             * MSG_DONTWAIT: if the socket's send buffer is full, skip this
+             * client rather than blocking. During shutdown we cannot afford
+             * to stall on a single slow client. The client will get a broken
+             * pipe instead - acceptable.
+             */
+            send(conn_map.buckets[i].fd, &shutdown_hdr, sizeof(shutdown_hdr),
+                MSG_DONTWAIT);
+            notified++;
+        }
+    }
+
+    log_info("Shutdown packet sent to %d/%d client(s)", notified, total);
+
+    /**
+     * Wait 2 seconds for clients to receive the shutdown packet and begin
+     * reconnecting. This window prevents clients from experiencing an
+     * unexpected broken pipe.
+     * 
+     * Note: this blocks the process for 2 seconds. This is intentional - the
+     * event loop has already stopped, so no client data is being dropped
+     * during this wait.
+     */
+    if (notified > 0) {
+        log_info("Waiting 2 seconds for clients to receive shutdown...");
+        sleep(2);
+    }
+
+    /**
+     * Force-close all remaining client connections.
+     * After this point any pending data is discarded by the OS.
+     */
+    int closed = 0;
+    for (int i = 0; i < CONN_MAP_BUCKETS; i++) {
+        if (!conn_map.buckets[i].in_use) continue;
+        int fd = conn_map.buckets[i].fd;
+        if (fd >= 0) {
+            close(fd);
+            closed++;
+        }
+    }
+    log_info("Force-closed %d connection(s)", closed);
+
+    // Close engine sockets and epoll
     if (server_fd != -1) {
         close(server_fd);
         server_fd = -1;
@@ -944,7 +1014,10 @@ static void perform_graceful_shutdown(void)
         epfd = -1;
     }
 
-    log_info("Graceful shutdown complete");
+    // Clean up libcurl global state
+    auth_http_curl_cleanup();
+
+    log_info("Graceful shutdown complete (worker pid=%d)", (int)getpid());
 }
 
 /**

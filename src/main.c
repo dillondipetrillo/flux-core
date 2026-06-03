@@ -181,8 +181,26 @@ int main(void)
      */
     int workers = config.worker_count;
     if (workers <= 0) {
+        /**
+         * ENGINE_WORKER_COUNT=0 is an explicit opt-in to auto-detect.
+         * Default is 1. Operators who want auto-detect set
+         * ENGINE_WORKER_COUNT=0 in production after verifying their machine
+         * has sufficient memory for (cpu_count * max_clients) client_info
+         * structs.
+         * 
+         * Memory estimate per worker:
+         *      max_clients * (recv_buf + send_buf + overhead)
+         *      = max_clients * 75KB
+         *      = 10000 * 75KB = ~720MB per worker
+         * 
+         * Verify your available RAM before enabling auto-detect.
+         */
         workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (workers <= 0) workers = 1; // sysconf can return -1 on error
+        log_info("ENGINE_WORKER_COUNT=0: auto-detect %d CPU core(s). "
+            "Verify RAM >= %d workers x %d clients x ~75KB = ~%dMB",
+            workers, workers, config.max_clients,
+            (int)((long long)workers * config.max_clients * 75 / 1024));
     }
 
     /**

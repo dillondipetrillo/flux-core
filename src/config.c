@@ -44,7 +44,7 @@ struct engine_config config_load(void)
     /* Capacity */
     config.max_clients = env_int("ENGINE_MAX_CLIENTS", 10000);
     config.max_events = env_int("ENGINE_MAX_EVENTS", 1024);
-    config.worker_count = env_int("ENGINE_WORKER_COUNT", 0);
+    config.worker_count = env_int("ENGINE_WORKER_COUNT", 1);
 
     /* Rate limiting */
     config.conn_rate_limit = env_int("ENGINE_CONN_RATE_LIMIT", 10);
@@ -82,8 +82,11 @@ void config_log(const struct engine_config *config)
     log_info("=== Engine Configuration ===");
     log_info("Network:      port=%d health=%d backlog=%d", config->port,
         config-> health_port, config->backlog);
-    log_info("Capacity:     max_clients=%d max_events=%d worker_count=%d",
-        config->max_clients, config->max_events, config->worker_count);
+    log_info("Capacity:     max_clients=%d max_events=%d worker_count=%d%s",
+        config->max_clients, config->max_events, config->worker_count,
+        config->worker_count == 0 ? " (auto-detect CPU count)" :
+        config->worker_count == 1 ? " (default - set ENGINE_WORKER_COUNT "
+        "for scaling)" : "");
     log_info("Rate:         conn_rate_limit=%d/sec/ip",
         config->conn_rate_limit);
     log_info("Buffers:      send=%d recv=%d", config->send_buf_size,
