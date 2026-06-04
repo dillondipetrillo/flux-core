@@ -298,6 +298,7 @@ int engine_init (struct engine_config *config)
         close(server_fd);
         return -1;
     }
+    log_info("Engine listening on port %d", config->port);
 
     // Health check socket
     health_fd = socket(PF_INET, SOCK_STREAM, 0);
@@ -323,9 +324,6 @@ int engine_init (struct engine_config *config)
             log_error("Health check DISABLED - "
                 "load balancer checks will fail");
         } else {
-            log_info("Health check ENABLED on port %d (worker pid=%d)",
-                config->health_port, (int)getpid());
-
             struct epoll_event hev;
             hev.events = EPOLLIN | EPOLLET;
             hev.data.fd = health_fd;
@@ -334,12 +332,13 @@ int engine_init (struct engine_config *config)
                     strerror(errno));
                 close(health_fd);
                 health_fd = -1;
+            } else {
+                log_info("Health check ENABLED on port %d (worker pid=%d)",
+                    config->health_port, (int)getpid());
             }
         }
     }
 
-    log_info("Engine listening on port %d", config->port);
-    log_info("Health check on port %d", config->health_port);
     return 0;
 }
 
@@ -1014,14 +1013,22 @@ static void handle_client_writable(int fd)
 }
 
 /**
- * handle_health_check - respond to load balancer health probes.
+ * handle_health_check - respond to load balancer and monitoring probes.
  * 
- * AWS load balancers, Kubernetes, and Docker healthcheck all connect to a
- * designated port periodically. If no response, the instance is marked
- * unhealthy and traffic is rerouted.
+ * Accepts a connection on health_fd, sends a status response, closes.
+ * Does not register with epoll - health checks are short-lived and handled
+ * synchronously. One accept per event, no looping needed because health_fd
+ * is edge-triggered and health probes are infrequent.
  * 
- * We accept, send a one-line response, and close immediately.
- * No auth, no epoll registration - just a quick reply.
+ * Response format is line-delimited key-value pairs ending with CRLF.
+ * Load balancers check for HTTP 200 or a specific string like "STATUS OK".
+ * 
+ * WORKER_PID: identifies which worker responded - essential for debugging
+ *      worker-specific issues in multi-process mode.
+ * CONNECTIONS: active connections on THIS work (not aggregate).
+ * POOL_FREE: available client slots on THIS worker.
+ * POOL_MAX: total client slots configured for this worker.
+ * UPTIME: seconds since this worker's engine_init completed.
  */
 static void handle_health_check(void)
 {
@@ -1031,16 +1038,18 @@ static void handle_health_check(void)
     char response[512];
     int n = snprintf(response, sizeof(response),
         "STATUS OK\r\n"
+        "WORKER_PID %d\r\n"
         "CONNECTIONS %d\r\n"
         "POOL_FREE %d\r\n"
         "POOL_MAX %d\r\n"
         "UPTIME %lu\r\n",
+        (int)getpid(),
         conn_map_count(&conn_map),
         free_count,
         cfg->max_clients,
         (unsigned long)(time(NULL) - start_time));
 
-    send(fd, response, (size_t)n, 0);
+    send(fd, response, (size_t)n, MSG_DONTWAIT);
     close(fd);
 }
 
