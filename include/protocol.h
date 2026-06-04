@@ -44,8 +44,8 @@ struct client_info {
     uint32_t client_id;
     uint32_t scopes[MAX_SCOPES];
     uint32_t user_id;               // returned by auth hook
-    char recv_buf[MAX_BUFF_SIZE];   // accumulates partial packets
-    char send_buf[MAX_SEND_BUFF];   // outbound queue for slow clients
+    char *recv_buf;                 // accumulates partial packets
+    char *send_buf;                 // outbound queue for slow clients
     char session_token[256];        // raw token from client
     size_t recv_len;                // bytes currently in recv_buf
     size_t send_len;                // bytes queued to send

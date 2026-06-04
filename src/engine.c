@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <sys/epoll.h>
@@ -46,8 +47,8 @@ static struct conn_map conn_map;
 
 // Memory pool - pre-allocated client_info structs.
 #define POOL_MAX 10000
-static struct client_info pool[POOL_MAX];
-static struct client_info *free_list[POOL_MAX];
+static struct client_info *pool = NULL;
+static struct client_info **free_list = NULL;
 static int free_count = 0;
 
 /**
@@ -214,12 +215,46 @@ int engine_init (struct engine_config *config)
     // Memory pool
     int pool_size = config->max_clients < POOL_MAX ? config->max_clients :
         POOL_MAX;
+    if (pool_size <= 0) pool_size = 100;
+
+    pool = malloc((size_t)pool_size * sizeof(struct client_info));
+    free_list = malloc((size_t)pool_size * sizeof(struct client_info));
+
+    if (!pool || !free_list) {
+        log_error("engine_init: failed to allocate pool metadata for %d slots",
+            pool_size);
+        free(pool);
+        free(free_list);
+        return -1;
+    }
+
     for (int i = 0; i < pool_size; i++) {
         memset(&pool[i], 0, sizeof(struct client_info));
+        /**
+         * After memset, recv_buf and send_buf are NULL
+         * (zero bytes = NULL pointer). This is correct - buffers are not
+         * allocated until a client connects. pool_free checks for non-NULL
+         * pointers so NULL here is the correct initial state indicating
+         * "no buffers allocated yet".
+         */
+        pool[i].recv_buf = NULL;
+        pool[i].send_buf = NULL;
         free_list[i] = &pool[i];
     }
     free_count = pool_size;
-    log_info("Memory pool: %d client slots pre-allocated", pool_size);
+
+    /**
+     * Memory usage at startup:
+     *      Pool metadata: pool_size x ~200 bytes = ~2MB for 10,000 slots
+     *      Buffer memory: 0 bytes (allocated per-connection on accept)
+     * 
+     * Memory usage at max load:
+     *      Pool metadata: ~2MB (unchanged)
+     *      Buffer memory: active_connections x (MAX_BUFF_SIZE + MAX_SEND_BUF)
+     *          = active_connections x ~74KB
+     */
+    log_info("Memory pool: %d client slots (metadata only, buffers allocated "
+        "per-connection)", pool_size);
 
     // Epoll instance
     epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -377,15 +412,78 @@ static int set_nonblocking(int fd)
 static struct client_info *pool_alloc(void)
 {
     if (free_count == 0) return NULL;
-    struct client_info *c = free_list[--free_count];
-    memset(c, 0, sizeof(*c));
-    return c;
+    
+    struct client_info *client = free_list[--free_count];
+
+    /**
+     * Allocate network buffers for this specific client connection.
+     * Buffers are allocated here - not at startup - so idle pool slots
+     * consume zero buffer memory. Only active connections use buffer RAM.
+     * 
+     * recv_buf: accumulates incoming TCP data between epoll events.
+     *      Must hold at least one maximum-size packet (header + payload).
+     * 
+     * send_buf: queues outgoing data for slow clients (backpressue buffer).
+     *      Sized to hold several maximum-size packets before we disconnect.
+     */
+    client->recv_buf = malloc(MAX_BUFF_SIZE);
+    client->send_buf = malloc(MAX_SEND_BUFF);
+
+    if (!client->recv_buf || !client->send_buf) {
+        log_error("OOM: cannot allocate network buffers (active connections "
+            "may be exhausting available RAM)");
+        free(client->recv_buf);
+        free(client->send_buf);
+        client->recv_buf = NULL;
+        client->send_buf = NULL;
+        free_list[free_count++] = client; // return slot to pool
+        return NULL;
+    }
+
+    /**
+     * Initialize fields explicitly rather than memset-ing the whole struct.
+     * We cannot memset because recv_buf and send_buf are now pointers -
+     * memset would overwrite them with zeros, losing the just-allocated
+     * addresses.
+     */
+    client->socket_fd = -1;
+    client->client_id = 0;
+    client->user_id = 0;
+    client->scope_count = 0;
+    client->is_authenticated = 0;
+    client->recv_len = 0;
+    client->send_len = 0;
+    client->send_offset = 0;
+    client->bytes_sent = 0;
+    client->bytes_recv = 0;
+    memset(client->session_token, 0, sizeof(client->session_token));
+    memset(client->scopes, 0, sizeof(client->scopes));
+
+    return client;
 }
 
 static void pool_free(struct client_info *client)
 {
     if (!client) return;
-    memset(client, 0, sizeof(*client));
+    
+    /**
+     * Buffers must be freed by disconnect_client BEFORE calling pool_free.
+     * If recv_buf or send_buf are non_NULL here, it is a bug in the caller.
+     * Log it loudly so it is caught.
+     */
+    if (client->recv_buf != NULL) {
+        log_error("pool_free: recv_buf not freed before returning slot "
+            "(memory leak) - fd=%d", client->socket_fd);
+        free(client->recv_buf);
+        client->recv_buf = NULL;
+    }
+    if (client->send_buf != NULL) {
+        log_error("pool_free: send_buf not freed before returning slot "
+            "(memory leak) - fd=%d", client->socket_fd);
+        free(client->send_buf);
+        client->send_buf = NULL;
+    }
+
     free_list[free_count++] = client;
 }
 
@@ -527,6 +625,22 @@ static void disconnect_client(int fd)
     conn_map_remove(&conn_map, fd);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
+
+    /**
+     * Free network buffers before returning the slot to the pool. Order
+     * matters: buffers freed here, then pool_free returns the metadata slot.
+     * pool_free checks for non-NULL pointers and logs an error if buffers
+     * were not freed - this catches bugs early.
+     */
+    if (client->recv_buf != NULL) {
+        free(client->recv_buf);
+        client->recv_buf = NULL;
+    }
+    if (client->send_buf != NULL) {
+        free(client->send_buf);
+        client->send_buf = NULL;
+    }
+    
     pool_free(client);
 }
 
@@ -988,26 +1102,29 @@ struct cleanup_ctx {
     int closed;
 };
 
-/**
- * cleanup_callback - force-close one client connection.
- * 
- * Called for every active connection after the 2-second shutdown window.
- * Removes the fd from epoll before closing - explicit DEL before close is
- * best-practice even though Linux auto-removes on close.
- * 
- * Does NOT call disconnect_client() because that function calls
- * conn_map_remove() which modifies the map during iteration. Raw close is
- * correct here, we are shutting down entirely, not maintaining any map state
- * after this point.
- */
 static void cleanup_callback(int fd, struct client_info *client,
     void *userdata)
 {
     struct cleanup_ctx *ctx = (struct cleanup_ctx *)userdata;
-    (void)client; // not needed for force-close
 
-    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-    close(fd);
+    /**
+     * Call disconnect_client which handles the complete cleanup sequence:
+     *      1. Remove from conn_map and scope_map
+     *      2. Remove from epoll
+     *      3. Close the fd
+     *      4. Free recv_buf and send_buf
+     *      5. Return slot to pool
+     * 
+     * We cannot call conn_map_foreach AND modify the map during iteration -
+     * but disconnect_client calls conn_map_remove which modifies the map.
+     * 
+     * This is safe here because conn_map_foreach has already captured the fd
+     * from the bucket before calling this callback. The removal of that
+     * specific entry does not affect iteration of subsequent buckets because
+     * conn_map_foreach iterates by index, not by following pointers.
+     */
+    (void)client;
+    disconnect_client(fd);
     ctx->closed++;
 }
 
@@ -1093,6 +1210,13 @@ static void perform_graceful_shutdown(void)
         close(epfd);
         epfd = -1;
     }
+
+    // Free pool metadata arrays
+    free(pool);
+    pool = NULL;
+    free(free_list);
+    free_list = NULL;
+    free_count = 0;
 
     // Clean up libcurl global state
     auth_http_curl_cleanup();

@@ -22,11 +22,11 @@ struct engine_config {
     /* Capacity */
     int max_clients;            // maximum simultaneous connections
     int max_events;             // epoll_wait max events per call
-    int worker_count;           /* ENGINE_WORKER_COUNT, default 1.
-                                 * Set to 0 to auto-detect CPU count (see
-                                 * main.c warning).
-                                 * Production: set explicitly to match
-                                 * available RAM. */
+    int worker_count;           /* ENGINE_WORKER_COUNT, default 0 = auto-detect
+                                 * CPU count. Set explicitly to limit workers
+                                 * on memory-constrained machines. Each worker
+                                 * uses ~2MB idle + ~74KB per active
+                                 * connection. */
 
     /* Rate limiting */
     int conn_rate_limit;        // max new connections per IP per second
