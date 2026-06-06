@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <endian.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,17 +7,12 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include "config.h"
 #include "protocol.h"
 #include "utils.h"
 
-#if defined(__APPLE__)
-    #include <machine/endian.h>
-    #include <libkern/OSByteOrder.h>
-    #define htobe64(x) OSSwapHostToBigInt64(x)
-    #define be64toh(x) OSSwapBigToHostInt64(x)
-#else
-    #include <endian.h>
-#endif
+#define MAX_NAME 32
 
 void send_packet(int socket_fd, enum packet_type type, uint32_t scope,
     uint64_t expires, const char *payload, size_t payload_len)
@@ -38,6 +34,7 @@ void send_packet(int socket_fd, enum packet_type type, uint32_t scope,
 
 int main(int argc, char **argv)
 {
+    struct engine_config config = config_load();
     int socketfd = socket(PF_INET, SOCK_STREAM, 0);
     if (socketfd == -1) {
         perror("socket");
@@ -47,7 +44,7 @@ int main(int argc, char **argv)
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_port = htons(PORT);
+    address.sin_port = htons(config.port);
     inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
 
     if (connect(socketfd, (struct sockaddr *)&address,
@@ -189,8 +186,8 @@ int main(int argc, char **argv)
                     printf("You must /join a scope before sending "
                         "messsages.\n");
                 } else {
-                    send_packet(socketfd, TYPE_APP_REALTIME, active_scope,
-                        (uint64_t)time(NULL) - 1, input, strlen(input));
+                    send_packet(socketfd, TYPE_APP_REALTIME, active_scope, 0,
+                        input, strlen(input));
                 }
             }
         }
@@ -241,10 +238,12 @@ int main(int argc, char **argv)
 
             switch ((enum packet_type)r_header.type) {
                 case TYPE_SYS_ACK: {
-                    struct response_payload *rp =
-                        (struct response_payload *)r_payload;
-                    uint32_t code = ntohl(rp->status_code);
-                    (void)code;
+                    // Read and discard the 4-byte response payload
+                    struct response_payload rp;
+                    memcpy(&rp, r_payload, sizeof(rp));
+                    uint32_t code = ntohl(rp.status_code);
+                    printf("[ACK] status=%u\n", code);
+                    break;
 
                     if (pending_scope != 0) {
                         active_scope = pending_scope;
@@ -275,9 +274,11 @@ int main(int argc, char **argv)
                     break;
                 }
                 case TYPE_SYS_ERROR: {
-                    struct response_payload *rp = 
-                        (struct response_payload *)r_payload;
-                    uint32_t code = ntohl(rp->status_code);
+                    struct response_payload rp;
+                    memcpy(&rp, r_payload, sizeof(rp));
+                    uint32_t code = ntohl(rp.status_code);
+                    printf("[ERROR] status=%u\n", code);
+                    break;
 
                     pending_scope = 0;
                     pending_leave_scope = 0;
@@ -313,6 +314,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 case TYPE_SYS_PING:
+                    // Silently consume ping responses
                     break;
                 default:
                     r_payload[r_header.payload_len] = '\0';

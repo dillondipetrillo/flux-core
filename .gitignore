@@ -1,18 +1,41 @@
 # Compiled binaries
 server
 client
+server_san
 
-# Obect files
+# Build artifacts
 *.o
-
-# Runtime log files
-logs/
-
-# Mac filesystem noise
 .DS_Store
 *.dSYM
 
+# Runtime log files
+logs/*
+
+# Do NOT ignore the .gitkeep file in logs
+!logs/.gitkeep
+
+# Go build artifacts
+sidecar/auth-sidecar
+sidecar/*.exe
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Test binaries
+tests/run_*
+bench/bench_routing
+
+# Docker
+.docker/
+
 # Editor artifacts
 .vscode/
+.idea/
 *.swp
 *.swo
