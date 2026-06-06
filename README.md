@@ -11,7 +11,7 @@ Unlike traditional message brokers (Kafka, RabbitMQ) that focus on persistence a
 ## Features
 - **Binary Protocol:** Packed C structs for minimal bandwidth overhead.
 - **Strict Byte-Ordering:** Big-Endian enforcement (`htonl`, `htobe64`) for cross-platform compatibility (Mobile/Web/Desktop).
-- **Non-Blocking I/O:** Powered by a high-efficiency `select()` loop.
+- **Non-Blocking I/O:** Powered by a high-efficiency epoll loop.
 - **Identity Gate:** Server-side authority for `sender_id` to prevent identity spoofing.
 - **Stress Tested:** Successfully handles 500+ packet bursts without sync loss.
 - **Scope-Based Routing:** Logical isolation of data (Rooms/Channels) via ```scope_id```.
@@ -31,22 +31,6 @@ Byte 5-7:   reserved (must be zero)
 Auth services must respond within 500ms or the connection is rejected. This protects the engine from a hung auth service stalling new connections.
 
 ```ENGINE_AUTH_SOCKET``` environment variable controls the path. Empty string means use the development hook (accepts everything).
-
-## Project Structure
-```
-.
-├── include/           # Header files (The Public API)
-│   ├── protocol.h     # Binary packet definitions & constants
-│   ├── logger.h       # System logging interface
-│   └── utils.h        # Networking wrappers
-├── src/               # Implementation files
-│   ├── server.c       # Core State Bus Router
-│   ├── client.c       # Reference Test Client
-│   ├── logger.c       # Thread-safe logging logic
-│   └── utils.c        # Byte-handling logic
-├── Makefile           # Automated build system
-└── README.md          # System documentation
-```
 
 ## Quick Start
 **1. Build the Ecosystem**
