@@ -16,6 +16,7 @@ TEST_CONN_MAP = tests/test_conn_map.c src/conn_map.c
 TEST_PROTOCOL = tests/test_protocol.c
 TEST_RATE_LIMIT = tests/test_rate_limit.c
 TEST_SCOPE_MAP = tests/test_scope_map.c src/scope_map.c
+TEST_TTL = tests/test_ttl.c
 
 all: server client
 
@@ -44,22 +45,30 @@ tests/run_rate_limit: $(TEST_RATE_LIMIT)
 tests/run_scope_map: $(TEST_SCOPE_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SCOPE_MAP)
 
+tests/run_ttl: $(TEST_TTL)
+	$(CC) $(CFLAGS) -o $@ $(TEST_TTL)
+
 test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
-		tests/run_conn_map tests/run_protocol
+		tests/run_conn_map tests/run_protocol tests/run_ttl
 	./tests/run_auth
 	./tests/run_conn_map
 	./tests/run_protocol
 	./tests/run_rate_limit
 	./tests/run_scope_map
+	./tests/run_ttl
 	@echo "All unit tests passed."
 
 sanitize: $(ENGINE_SRCS)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -o server_san \
 		$(ENGINE_SRCS) $(LDFLAGS)
 
+integration: tests/test_integration.c src/logger.c
+	$(CC) $(CFLAGS) -o tests/run_integration \
+		tests/test_integration.c src/logger.c -lpthread
+
 clean:
 	rm -f server client server_san
 	rm -rf tests/run_*
 	rm -rf *.dSYM
 
-.PHONY: all clean
+.PHONY: all test integration sanitize clean
