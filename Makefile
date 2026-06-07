@@ -59,8 +59,8 @@ test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
 	@echo "All unit tests passed."
 
 sanitize: $(ENGINE_SRCS)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -o server_san \
-		$(ENGINE_SRCS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o server_san $(ENGINE_SRCS) $(LDFLAGS)
 
 integration: tests/test_integration.c src/logger.c
 	$(CC) $(CFLAGS) -o tests/run_integration \
