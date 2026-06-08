@@ -66,9 +66,21 @@ integration: tests/test_integration.c src/logger.c
 	$(CC) $(CFLAGS) -o tests/run_integration \
 		tests/test_integration.c src/logger.c -lpthread
 
+bench: bench/bench_routing.c src/logger.c
+	$(CC) $(CFLAGS) -O2 -o bench/bench_routing bench/bench_routing.c \
+		src/logger.c -lpthread
+
+debug: CFLAGS += -DDEBUG_LOG
+debug: all
+
+server_opt: $(ENGINE_SRCS)
+	$(CC) -Wall -Wextra -O2 -Iinclude -o server_opt $(ENGINE_SRCS) \
+		-lpthread -lssl -lcrypto -lcurl
+
 clean:
-	rm -f server client server_san
+	rm -f server client server_san server_opt
 	rm -rf tests/run_*
+	rm -rf bench/bench_routing
 	rm -rf *.dSYM
 
-.PHONY: all test integration sanitize clean
+.PHONY: all test integration sanitize bench debug clean
