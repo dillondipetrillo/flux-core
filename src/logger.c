@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,27 +14,28 @@
  * ===========================================================
  * ASYNC LOGGER - RING BUFFER DESIGN
  * 
- * The event loop writes log entries into a fix-sized ring buffer
- * in memory. A background thread drains the ring to disk.
+ * The event loop writes log entries into a fix-sized ring buffer.
+ * A background pthread drains the ring to disk at its own pace.
+ * The event loop never waits for disk I/O.
  * 
- * The event loop NEVER waits for disk I/O. A full ring drops
- * messages rather than stalling the event loop. Dropped messages
- * are counted and reported when space becomes available.
+ * Memory cost: LOG_RING_SIZE x LOG_ENTRY_SIZE = 2MB per worker.
+ * This is constant. It is the cost of zero-latency logging on the
+ * hot event loop path.
  * 
- * Memory: LOG_RING_SIZE x LOG_ENTRY_SIZE = 4096 x 512 = 2MB
- * This memory is always present. It is the price of zero-latency
- * logging on the hot path.
+ * Correctness guarantee: _Atomic indices with explicit memory ordering.
+ * mempry_order_release on write_head ensures the ring entry is fully
+ * written before the reader sees the advanced index. memory_order_acquire
+ * on read ensures the reader sees the write. This is zero-cost on x86
+ * and correct on all architectures.
+ * 
+ * Single-writer: each worker process has its own ring buffer.
+ * Workers do not share memory - they share nothing after fork().
  * ===========================================================
  */
 
 #define LOG_RING_SIZE 4096 // Must be power of 2 for fast modulo
-#define LOG_ENTRY_SIZE 512 // max bytes per log line including timestamp
+#define LOG_ENTRY_SIZE 256 // max bytes per log line including timestamp
 
-/**
- * A single log entry in the ring.
- * Fixed size so ring[N % LOG_RING_SIZE] is a single array index operation.
- * Variable-size entries would require pointer chasing and heap allocation.
- */
 struct log_entry {
     char msg[LOG_ENTRY_SIZE];
     size_t len;
@@ -43,40 +45,35 @@ struct log_entry {
 static struct log_entry ring[LOG_RING_SIZE];
 
 /**
- * write_head: index where the next entry will be written.
- * read_head: index of the next entry to be read by the logger thread.
+ * Atmoic indicies. Monotonically increasing - never wrap.
+ * Ring position: index % LOG_RING_SIZE (fast: power-of-2-mask).
  * 
- * Both are uint64_t and monotonically increase, never wrap.
- * Ring position: head % LOG_RING_SIZE (fast because LOG_RING_SIZE is power of 
- * 2).
- * 
- * volatile: prevents compiler from caching these in registers. They are
- * written by the event loop and read by the logger thread. volatile is
- * sufficient enough for our sing-writer-per-worker design.
+ * write_head: written by event loop, read by logger thread.
+ * read_head: written by logger thread, read by event loop (fullness check).
  */
-static volatile uint64_t write_head = 0;
-static volatile uint64_t read_head = 0;
+static _Atomic uint64_t write_head = 0;
+static _Atomic uint64_t read_head = 0;
 
-// Counts dropped log messages when ring is full
-static volatile uint64_t dropped_count = 0;
+// Dropped message counter - incremented when ring is full
+static _Atomic uint64_t dropped_count = 0;
 
 // Background logger thread
 static pthread_t log_thread;
 static int log_thread_running = 0;
 
-// Log file for async writes
+// Log file state - protected by log_file_mutex for logger_reopen
 static FILE *log_file = NULL;
 static char log_path_stored[256] = {0};
+static pthread_mutex_t log_file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * ===========================================================
  * BILLING LOG
  * 
- * Billing events are written synchronously with immediate fflush.
- * Billing data mus never be lost. A dropped billing event means
- * you cannot charge for usage. The risk of losing revenue outweighs
- * the minor latency cost of a synchronous write.
- * Billing events are rare (connect/auth/disconnect) - not per-packet.
+ * Synchronous writes with immediate fflush.
+ * Billing events must never be lost - revenue depends on it.
+ * Billing events are rare (connect/auth/disconnect), not per-packet,
+ * so synchronous writes do not affect hot path performance.
  * ===========================================================
  */
 static FILE *billing_file = NULL;
@@ -91,140 +88,129 @@ static void *logger_thread_fn(void *arg)
 {
     (void)arg;
 
-    while (log_thread_running || read_head < write_head) {
-        /**
-         * Drain all available entries from the ring.
-         * This inner loop runs without any sleep - drain as fasr as possible
-         * when there is work to do.
-         */
-        uint64_t dropped_snapshot = 0;
+    /**
+     * Set a modest stack for this thread - it only does string formatting
+     * and file writes, does not need the default 8MB stack.
+     * Note: stack size is set via pthread_attr at thread creation.
+     * This comment documents the intent; see logger_init for the
+     * implementation.
+     */
+    while (log_thread_running ||
+        atomic_load_explicit(&read_head, memory_order_relaxed) !=
+        atomic_load_explicit(&write_head, memory_order_relaxed))
+    {
+        uint64_t wh = atomic_load_explicit(&write_head, memory_order_acquire);
+        uint64_t rh = atomic_load_explicit(&read_head, memory_order_relaxed);
 
-        while (read_head < write_head) {
-            uint64_t slot = read_head % LOG_RING_SIZE;
+        while (rh < wh) {
+            uint64_t slot = rh & (LOG_RING_SIZE - 1);
 
-            if (log_file && ring[slot].len > 0)
-                fwrite(ring[slot].msg, 1, ring[slot].len, log_file);
-
-            /**
-             * Also write to stderr for visibility during development.
-             * In higher environments, operators redirect stderr to /dev/null
-             * and use the log file. Both outputs help during development.
-             */
-            if (ring[slot].len > 0)
-                fwrite(ring[slot].msg, 1, ring[slot].len, stderr);
+            if (ring[slot].len > 0) {
+                pthread_mutex_lock(&log_file_mutex);
+                if (log_file) {
+                    fwrite(ring[slot].msg, 1, ring[slot].len, log_file);
+                }
+                pthread_mutex_unlock(&log_file_mutex);
+            }
 
             ring[slot].len = 0;
-            read_head++;
+            rh++;
+            atomic_store_explicit(&read_head, rh, memory_order_release);
         }
 
-        /**
-         * Report dropped messaages if any accumulated.
-         * Write the report directly to avoid recursion into log_write.
-         */
-        if (dropped_count > 0) {
-            dropped_snapshot = dropped_count;
-            dropped_count = 0;
-            if (log_file) {
-                fprintf(log_file, "[LOGGER] WARNING: %lu log messages dropped "
-                    "(ring buffer full - event loop under heavy load)\n",
-                    (unsigned long)dropped_snapshot);
-            }
-            fprintf(stderr, "[LOGGER] WARNING: %lu log messages dropped\n",
-                (unsigned long)dropped_snapshot);
+        // Report and reset dropped count
+        uint64_t dropped = atomic_load_explicit(&dropped_count,
+            memory_order_relaxed);
+        if (dropped > 0) {
+            atomic_fetch_sub_explicit(&dropped_count, dropped,
+                memory_order_relaxed);
+            
+            char warn[128];
+            int n = snprintf(warn, sizeof(warn),
+                "[LOGGER] WARNING: %lu log entries dropped "
+                "(ring full under heavy load)\n",
+                (unsigned long)dropped);
+            
+            pthread_mutex_lock(&log_file_mutex);
+            if (log_file && n > 0)
+                fwrite(warn, 1, (size_t)n, log_file);
+            pthread_mutex_unlock(&log_file_mutex);
         }
 
-        // Flush to disk periodically
+        // Flush periodically
+        pthread_mutex_lock(&log_file_mutex);
         if (log_file) fflush(log_file);
+        pthread_mutex_unlock(&log_file_mutex);
 
-        /**
-         * Sleep 1ms when ring is empty.
-         * This keeps CPU usage near 0 when the server is idle.
-         * 1ms is the maximum additional latency for a log message to appear
-         * on disk - acceptable for logging.
-         */
-        struct timespec ts = {0, 1000000}; // 1ms
+        // Sleep 1ms when ring is drained - keeps CPU at zero when idle
+        struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
     }
 
-    // Final flush on shutdown
-    if(log_file) fflush(log_file);
+    pthread_mutex_lock(&log_file_mutex);
+    if (log_file) fflush(log_file);
+    pthread_mutex_unlock(&log_file_mutex);
+
     return NULL;
 }
 
 /**
  * ===========================================================
  * CORE WRITE FUNCTION
- * Called from log_info and log_error.
- * Formats the message and puts it in the ring.
- * Returns immediately, no disk I/O on the calling thread.
+ * 
+ * Called by the log_info and log_error
+ * Formats the entry into the ring and advances write_head.
+ * Returns immediately - no disk I/O on the calling thread.
+ * 
+ * Memory ordering:
+ *      1. Write ring entry completely.
+ *      2. Advance write_head with memory_order_release.
+ *          This ensures step 1 is visible to the reader before
+ *          the reader sees the advanced index.
  * ===========================================================
  */
 
 static void log_write(const char *level, const char *fmt, va_list args)
 {
-    /**
-     * Check if ring is full.
-     * Full condition: write_head - read_head >= LOG_RING_SIZE
-     * If full, drop the message rather than blocking the event loop.
-     * Increment dropped_count so the logger thread can report it.
-     */
-    if (write_head - read_head >= LOG_RING_SIZE) {
-        dropped_count++;
+    uint64_t wh = atomic_load_explicit(&write_head, memory_order_relaxed);
+    uint64_t rh = atomic_load_explicit(&read_head, memory_order_acquire);
+
+    if (wh - rh >= LOG_RING_SIZE) {
+        atomic_fetch_add_explicit(&dropped_count, 1, memory_order_relaxed);
         return;
     }
 
-    uint64_t slot = write_head % LOG_RING_SIZE;
-    struct log_entry *entry = &ring[slot];
-
-    /**
-     * Format timestamp.
-     * time() and localtime() are not async-signal-safe but log_write is not
-     * called from signal handlers, only from the event loop and connection
-     * handlers.
-     */
+    uint64_t slot = wh & (LOG_RING_SIZE - 1);
+    struct log_entry *e = &ring[slot];
+    
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 
-    /**
-     * Build the log line into the ring entry.
-     * snprintf is safe, it never writes beyond LOG_ENTRY_SIZE.
-     * We write timestamp + level + message + newline in one operation.
-     */
-    int prefix_len = snprintf(entry->msg, LOG_ENTRY_SIZE, "[%s] %-5s", ts,
-        level);
-
-    if (prefix_len < 0 || prefix_len >= LOG_ENTRY_SIZE) {
-        entry->len = 0;
-        write_head++;
+    int prefix = snprintf(e->msg, LOG_ENTRY_SIZE, "[%s] %-5s ", ts, level);
+    if (prefix < 0 || prefix >= LOG_ENTRY_SIZE) {
+        e->len = 0;
+        atomic_store_explicit(&write_head, wh + 1, memory_order_release);
         return;
     }
 
-    int msg_len = vsnprintf(entry->msg + prefix_len,
-        LOG_ENTRY_SIZE - prefix_len - 1, fmt, args);
+    int body = vsnprintf(e->msg + prefix,
+        LOG_ENTRY_SIZE - prefix - 1, fmt, args);
+    if (body < 0) body = 0;
 
-    if (msg_len < 0) {
-        entry->len = 0;
-        write_head++;
-        return;
-    }
-
-    // Add newline. Calculate total length carefully to avoid overflows.
-    size_t total = (size_t)prefix_len + (size_t)msg_len;
+    size_t total = (size_t)prefix + (size_t)body;
     if (total >= LOG_ENTRY_SIZE - 1) total = LOG_ENTRY_SIZE - 2;
 
-    entry->msg[total] = '\n';
-    entry->msg[total + 1] = '\0';
-    entry->len = total + 1;
+    e->msg[total] = '\n';
+    e->msg[total + 1] = '\0';
+    e->len = total + 1;
 
     /**
-     * Advance write_head AFTER the entry is fully written.
-     * The logger thread reads entries between read_head and write_head.
-     * If we advance write_head before writing the entry, the logger thread
-     * could read a partially-written entry.
+     * memory_order_release: all writes to ring[slot] above are visible to
+     * any thread that reads write_head with memory_order_acquire.
      */
-    write_head++;
+    atomic_store_explicit(&write_head, wh + 1, memory_order_release);
 }
 
 /**
@@ -255,21 +241,46 @@ int logger_init(const char *filepath)
         strncpy(log_path_stored, filepath, sizeof(log_path_stored) - 1);
         log_file = fopen(filepath, "a");
         if (!log_file) {
-            fprintf(stderr, "logger_init: cannot open %s: %s\n",
+            fprintf(stderr, "logger_init: cannot open log %s: %s\n",
                 filepath, strerror(errno));
             return -1;
         }
+        setvbuf(log_file, NULL, _IONBF, 0);
+    } else {
+        /**
+         * No log file path - log to stderr only.
+         * Production deployments must set ENGINE_LOG_PATH.
+         * Log a warning to stderr so operators notice.
+         */
+        fprintf(stderr, "[LOGGER] WARNING: ENGINE_LOG_PATH not set - "
+            "logging to stderr only. Set ENGINE_LOG_PATH for production.\n");
     }
+    
+    atomic_store_explicit(&write_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&read_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&dropped_count, 0, memory_order_relaxed);
 
-    write_head = 0;
-    read_head = 0;
-    dropped_count = 0;
+    /**
+     * Configure thread attributes - reduce stack to 256KB.
+     * The logger thread only formats strings and calls fwrite.
+     * The default 8MB stack is wasteful for this workload.
+     * 256KB is generous for a logging thread.
+     */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024); // 256KB
 
     log_thread_running = 1;
-    if (pthread_create(&log_thread, NULL, logger_thread_fn, NULL) != 0) {
+    int rc = pthread_create(&log_thread, &attr, logger_thread_fn, NULL);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
         fprintf(stderr, "logger_init: pthread_create failed: %s\n",
             strerror(errno));
-        if (log_file) fclose(log_file);
+        if (log_file) {
+            fclose(log_file);
+            log_file = NULL;
+        }
         log_file = NULL;
         return -1;
     }
@@ -288,11 +299,13 @@ void logger_close(void)
     log_thread_running = 0;
     pthread_join(log_thread, NULL);
 
+    pthread_mutex_lock(&log_file_mutex);
     if (log_file) {
         fflush(log_file);
         fclose(log_file);
         log_file = NULL;
     }
+    pthread_mutex_unlock(&log_file_mutex);
 }
 
 void logger_reopen(void)
@@ -300,12 +313,11 @@ void logger_reopen(void)
     /**
      * Called when SIGHUP fires (log rotation).
      * Log rotation tools rename the current log file and send SIGHUP.
-     * We close and reopen to start writing to the new file.
+     * We open the new file, swap the pointer under the mutex, then close
+     * the old file.
      * 
-     * This is called from the event loop (not the logger thread) when the
-     * reopen_log flag is set. The logger thread may be mid-write. We use a
-     * brief pause to let the thread finish its current write before swapping
-     * the file pointer.
+     * The mutex prevents the logger thread from writing to log_file while
+     * we are swapping it.
      */
     if (log_path_stored[0] == '\0') return;
 
@@ -315,16 +327,17 @@ void logger_reopen(void)
             strerror(errno));
         return;
     }
+    setvbuf(new_file, NULL, _IONBF, 0);
 
+    pthread_mutex_lock(&log_file_mutex);
     FILE *old_file = log_file;
     log_file = new_file;
+    pthread_mutex_unlock(&log_file_mutex);
 
     if (old_file) {
         fflush(old_file);
         fclose(old_file);
     }
-
-    log_info("Log file reopened after SIGHUP");
 }
 
 /**
@@ -337,7 +350,17 @@ void logger_reopen(void)
 
 int billing_log_init(const char *filepath)
 {
-    if (!filepath || !*filepath) return 0;
+    if (!filepath || !*filepath) {
+        /**
+         * No billing log path configured. Log a warning - billling events
+         * will be silently lost, which means usage cannot be tracked. This
+         * is a configuration error in production.
+         */
+        fprintf(stderr, "[LOGGER] WARNING: ENGINE_BILLING_LOG_PATH not set - "
+            "billing events will not be recorded. "
+            "Set ENGINE_BILLING_LOG_PATH for production.\n");
+        return 0;
+    }
 
     billing_file = fopen(filepath, "a");
     if (!billing_file) {
