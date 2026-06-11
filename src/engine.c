@@ -374,8 +374,6 @@ void engine_run(void)
         if (reopen_log) {
             logger_reopen();
             reopen_log = 0;
-            log_info("[Worker %d] Log file reopened after SIGHUP "
-                "(log rotation completed)", (int)getpid());
         }
 
         for (int i = 0; i < n; i++) {

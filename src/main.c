@@ -163,6 +163,13 @@ int main(void)
     struct engine_config config = config_load();
     g_config = &config;
 
+    // Initialize parent logger FIRST before config_log or any log calls.
+    if (logger_init_parent(config.log_path) == -1) {
+        fprintf(stderr, "FATAL: parent could not open log file: %s\n",
+            config.log_path);
+        return -1;
+    }
+        
     config_log(&config);
 
     /**
@@ -172,7 +179,7 @@ int main(void)
      */
     if (engine_prefork_init(&config) == -1) {
         log_error("FATAL: engine_prefork_init failed");
-        logger_close();
+        logger_close_parent();
         return 1;
     }
 
@@ -339,6 +346,6 @@ int main(void)
         }
     }
 
-    logger_close();
+    logger_close_parent();
     return 0;
 }

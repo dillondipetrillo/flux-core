@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "logger.h"
 
@@ -35,6 +36,15 @@
 
 #define LOG_RING_SIZE 4096 // Must be power of 2 for fast modulo
 #define LOG_ENTRY_SIZE 256 // max bytes per log line including timestamp
+
+/**
+ * Set to 1 by logger_init_parent - enables synchronous direct writes.
+ * Set to 0 by default - logger_init (worker mode) uses async ring buffer.
+ * This flag is set once before fork() and never changes in the parent.
+ * Each worker process gets its own copy after fork() with value 0, then calls
+ * logger_init() which confirms async mode.
+ */
+static int parent_mode = 0;
 
 struct log_entry {
     char msg[LOG_ENTRY_SIZE];
@@ -162,6 +172,8 @@ static void *logger_thread_fn(void *arg)
  * Formats the entry into the ring and advances write_head.
  * Returns immediately - no disk I/O on the calling thread.
  * 
+ * Parent mode: writes directly and synchronously, no ring buffer.
+ * 
  * Memory ordering:
  *      1. Write ring entry completely.
  *      2. Advance write_head with memory_order_release.
@@ -172,6 +184,40 @@ static void *logger_thread_fn(void *arg)
 
 static void log_write(const char *level, const char *fmt, va_list args)
 {
+    /**
+     * Parent mode: direct, synchronous writes.
+     * No ring buffer, no background thread.
+     * The parent logs rarely, startup config and worker lifecycle events.
+     * Direct writes are fine here and safer around fork().
+     */
+    if (parent_mode) {
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+
+        char msg[LOG_ENTRY_SIZE];
+        int prefix = snprintf(msg, LOG_ENTRY_SIZE, "[%s] %-5s ", ts, level);
+        if (prefix > 0 && prefix < LOG_ENTRY_SIZE)
+            vsnprintf(msg + prefix, LOG_ENTRY_SIZE - prefix - 1, fmt, args);
+        // Ensure newline
+        size_t len = strlen(msg);
+        if (len < LOG_ENTRY_SIZE - 1) {
+            msg[len] = '\n';
+            msg[len + 1] = '\0';
+            len++;
+        }
+
+        pthread_mutex_lock(&log_file_mutex);
+        if (log_file)
+            fwrite(msg, 1, len, log_file);
+        else
+            fwrite(msg, 1, len, stderr);
+        pthread_mutex_unlock(&log_file_mutex);
+        return;
+    }
+
+    // Worker mode: async ring buffer path
     uint64_t wh = atomic_load_explicit(&write_head, memory_order_relaxed);
     uint64_t rh = atomic_load_explicit(&read_head, memory_order_acquire);
 
@@ -237,6 +283,8 @@ void log_error(const char *fmt, ...)
 
 int logger_init(const char *filepath)
 {
+    parent_mode = 0; // worker mode, use async ring buffer
+
     if (filepath && *filepath) {
         strncpy(log_path_stored, filepath, sizeof(log_path_stored) - 1);
         log_file = fopen(filepath, "a");
@@ -337,6 +385,70 @@ void logger_reopen(void)
     if (old_file) {
         fflush(old_file);
         fclose(old_file);
+    }
+
+    /**
+     * Write confirmation directly, bypasses the async ring buffer.
+     * The ring buffer has up to 1ms drain latency. Writing directly here
+     * guarantees the message appears in the new file immediately.
+     * This is the only direct write in the worker, all other log calls use
+     * the async ring buffer path.
+     */
+    pthread_mutex_lock(&log_file_mutex);
+    if (log_file) {
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+        fprintf(log_file, "[%s] INFO [Worker pid=%d] Log file reopened "
+            "after SIGHUP (log rotation)\n", ts, (int)getpid());
+    }
+    pthread_mutex_unlock(&log_file_mutex);
+}
+
+/**
+ * logger_init_parent - lightweight synchronous logger for the parent process.
+ * 
+ * The parent process does not have a hot event loop and logs rarely.
+ * It does not need the async ring buffer or a background thread.
+ * This function opens the log file and enables direct synchronous writes.
+ * log_info and log_error called after this write directly to the file.
+ * 
+ * Must be called before fork(). Workers call logger_init() after fork().
+ * The parent calls logger_close_parent() before exiting.
+ */
+int logger_init_parent(const char *filepath)
+{
+    parent_mode = 1;
+
+    if (filepath && *filepath) {
+        strncpy(log_path_stored, filepath, sizeof(log_path_stored) - 1);
+        log_file = fopen(filepath, "a");
+        if (!log_file) {
+            fprintf(stderr, "logger_init_parent: cannot open %s: %s\n",
+                filepath, strerror(errno));
+            return -1;
+        }
+        /**
+         * _IONBF: disable stdio buffering.
+         * Parent writes are rare and synchronous.
+         * Multiple processes (parent + workers) write to this file.
+         */
+        setvbuf(log_file, NULL, _IONBF, 0);
+    } else {
+        fprintf(stderr, "[PARENT] WARNING: ENGINE_LOG_PATH not set - "
+            "logging to stderr only.\n");
+    }
+
+    return 0;
+}
+
+void logger_close_parent(void)
+{
+    if (log_file) {
+        fflush(log_file);
+        fclose(log_file);
+        log_file = NULL;
     }
 }
 
