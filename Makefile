@@ -58,9 +58,16 @@ test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
 	./tests/run_ttl
 	@echo "All unit tests passed."
 
+# AddressSanitizer + UndefinedBehaviorSanitizer
 sanitize: $(ENGINE_SRCS)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-o server_san $(ENGINE_SRCS) $(LDFLAGS)
+
+# ThreadSanitizer - detects data races between threads
+# Run separately from ASan - they cannot be combined
+tsan: $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer \
+		-o server_tsan $(ENGINE_SRCS) $(LDFLAGS)
 
 integration: tests/test_integration.c src/logger.c
 	$(CC) $(CFLAGS) -o tests/run_integration \
@@ -73,14 +80,14 @@ bench: bench/bench_routing.c src/logger.c
 debug: CFLAGS += -DDEBUG_LOG
 debug: all
 
+# Optimized production binary for benchmarking
 server_opt: $(ENGINE_SRCS)
-	$(CC) -Wall -Wextra -O2 -Iinclude -o server_opt $(ENGINE_SRCS) \
-		-lpthread -lssl -lcrypto -lcurl
+	$(CC) -Wall -Wextra -O2 -Iinclude -o server_opt $(ENGINE_SRCS) $(LDFLAGS)
 
 clean:
-	rm -f server client server_san server_opt
+	rm -f server client server_san server_opt server_tsan
 	rm -rf tests/run_*
 	rm -rf bench/bench_routing
 	rm -rf *.dSYM
 
-.PHONY: all test integration sanitize bench debug clean
+.PHONY: all test integration sanitize tsan bench debug clean
