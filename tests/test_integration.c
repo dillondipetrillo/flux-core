@@ -10,14 +10,19 @@
 #include "test_runner.h"
 
 /**
- * test_integration.c - End-to-end integration tests for the C State Bus.
+ * test_integration.c - End-to-end integration tests.
  * 
- * Requires a running server:
+ * Requires a running server in single worker mode:
  *      ENGINE_WORKER_COUNT=1 ./server &
  * 
- * These tests connect real TCP clients, send real binary packets, and verify
- * real responses. They test the entire system together - epoll, auth hook,
- * packet parsing, routing, TTL, and disconnect.
+ * Single-worker is required because two clients must land on the same worker
+ * to communicate via the same scope map.
+ * With multiple workers, clients may land on different workers and messages
+ * will not be routed between them.
+ * 
+ * All recv calls have SO_RCVTIMEO set to prevent indefinite hangs. Tests fail
+ * cleanly with a descriptive error if the server does not response within the
+ * timeout.
  * 
  * Run with:
  *      make integration
@@ -27,6 +32,18 @@
  #define SERVER_HOST "127.0.0.1"
  #define SERVER_PORT 8080
  #define TEST_TOKEN "test-integration-token"
+ #define RECV_TIMEOUT_S 3 // seconds before recv gives up
+
+ /**
+  * set_recv_timeout - set SO_RCVTIMEO on a socket.
+  * All integration test sockets must have this set.
+  * Without it, a misbehaving server causes the test to hang forever.
+  */
+static void set_recv_timeout(int fd)
+{
+    struct timeval tv = {RECV_TIMEOUT_S, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
 
  /**
   * connect_client - establish a TCP connection to the server.
@@ -47,6 +64,8 @@ static int connect_client(void)
         close(fd);
         return -1;
     }
+
+    set_recv_timeout(fd);
     return fd;
 }
 
@@ -81,14 +100,15 @@ static int recv_response(int fd)
 {
     struct packet_header hdr;
     ssize_t n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-    if (n != sizeof(hdr)) return -1;
+    if (n != (ssize_t)sizeof(hdr)) return -1;
 
     uint32_t payload_len = ntohl(hdr.payload_len);
     if (payload_len == 0) return (int)hdr.type;
+    if (payload_len > sizeof(struct response_payload)) return -1;
 
     struct response_payload rp;
     n = recv(fd, &rp, sizeof(rp), MSG_WAITALL);
-    if (n != sizeof(rp)) return -1;
+    if (n != (ssize_t)sizeof(rp)) return -1;
 
     return (int)ntohl(rp.status_code);
 }
@@ -100,22 +120,40 @@ static int recv_response(int fd)
 static int recv_app_packet(int fd, char *buf, size_t buf_size,
     uint32_t *out_scope, uint32_t *out_sender)
 {
-    struct packet_header hdr;
-    ssize_t n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-    if (n != sizeof(hdr)) return -1;
+    /**
+     * Drain up to 10 non-app packets (ACKs, pings) before giving up. This
+     * handles the case where ACKs from JOIN arrive before the routed
+     * message.
+     */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        struct packet_header hdr;
+        ssize_t n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
+        if (n != (ssize_t)sizeof(hdr)) return -1;
 
-    uint32_t payload_len = ntohl(hdr.payload_len);
-    if (out_scope) *out_scope = ntohl(hdr.scope_id);
-    if (out_sender) *out_sender = ntohl(hdr.sender_id);
+        uint32_t plen = ntohl(hdr.payload_len);
 
-    if (payload_len == 0) return 0;
-    if (payload_len >= buf_size) return -1;
+        if (hdr.type == TYPE_APP_REALTIME || hdr.type == TYPE_APP_STANDARD ||
+            hdr.type == TYPE_APP_BACKGROUND)
+        {
+            if (out_scope) *out_scope = ntohl(hdr.scope_id);
+            if (out_sender) *out_sender = ntohl(hdr.sender_id);
 
-    n = recv(fd, buf, payload_len, MSG_WAITALL);
-    if (n != (ssize_t)payload_len) return -1;
+            if (plen == 0) return 0;
+            if (plen >= buf_size) return -1;
 
-    buf[payload_len] = '\0';
-    return (int)payload_len;
+            n = recv(fd, buf, plen, MSG_WAITALL);
+            if (n != (ssize_t)plen) return -1;
+            buf[plen] = '\0';
+            return (int)plen;
+        }
+
+        // Drain non-app packet payload and continue
+        if (plen > 0 && plen <= 1024) {
+            char drain[1024];
+            recv(fd, drain, plen, MSG_WAITALL);
+        }
+    }
+    return -1;
 }
 
 /**
@@ -215,6 +253,33 @@ static void test_double_join_rejected(void)
     close(fd);
 }
 
+static void test_max_scopes_exhaustion(void)
+{
+    printf("\n-- MAX_SCOPES exhaustion --\n");
+    int fd = connect_client();
+    ASSERT(fd != -1, "connected");
+    ASSERT(authenticate(fd), "authenticated");
+
+    /**
+     * Join MAX_SCOPES scopes - all should succeed.
+     * Then joining one more must return STATUS_ERR_SCOPES_FULL.
+     * Uses scope IDs 7000+ to avoid colliding with other tests.
+     */
+    int succeeded = 0;
+    for (int i = 0; i < MAX_SCOPES; i++) {
+        send_packet(fd, TYPE_SYS_JOIN, (uint32_t)(7000 + i), NULL, 0, 0);
+        if (recv_response(fd) == STATUS_OK) succeeded++;
+
+        usleep(100000);
+    }
+    ASSERT(succeeded == MAX_SCOPES, "can jioin exactly MAX_SCOPES scopes");
+
+    send_packet(fd, TYPE_SYS_JOIN, 7999, NULL, 0, 0);
+    ASSERT(recv_response(fd) == STATUS_ERR_SCOPES_FULL,
+        "joining beyond MAX_SCOPES returns STATUS_ERR_SCOPES_FULL");
+    close(fd);
+}
+
 static void test_message_routing(void)
 {
     printf("\n-- message routing between two clients --\n");
@@ -235,9 +300,8 @@ static void test_message_routing(void)
     send_packet(sender, TYPE_APP_REALTIME, 300, msg, (uint32_t)strlen(msg),
         (uint64_t)exp);
 
-    char buf[1024];
-    uint32_t scope = 0;
-    uint32_t sender_id = 0;
+    char buf[1024] = {0};
+    uint32_t scope = 0, sender_id = 0;
     int len = recv_app_packet(receiver, buf, sizeof(buf), &scope, &sender_id);
 
     ASSERT(len > 0, "receiver got a packet");
@@ -251,29 +315,42 @@ static void test_message_routing(void)
 static void test_sender_does_not_receive_own_message(void)
 {
     printf("\n-- sender does not receive own message --\n");
-    int fd = connect_client();
-    ASSERT(fd != -1, "can connect");
-    ASSERT(authenticate(fd), "authenticated");
+    int a = connect_client();
+    int b = connect_client();
+    ASSERT(a != -1 && b != -1, "both clients connected");
+    ASSERT(authenticate(a), "client A authenticated");
+    ASSERT(authenticate(b), "cliebt B authenticated");
 
-    send_packet(fd, TYPE_SYS_JOIN, 400, NULL, 0, 0);
-    ASSERT(recv_response(fd) == STATUS_OK, "joined scope 400");
+    send_packet(a, TYPE_SYS_JOIN, 400, NULL, 0, 0);
+    ASSERT(recv_response(a) == STATUS_OK, "client A joined 400");
+    send_packet(b, TYPE_SYS_JOIN, 400, NULL, 0, 0);
+    ASSERT(recv_response(b) == STATUS_OK, "client B joined 400");
 
-    const char *msg = "self-send test";
-    send_packet(fd, TYPE_APP_REALTIME, 400, msg, (uint32_t)strlen(msg),
-        (uint64_t)(time(NULL) + 60));
+    // A sends a message
+    send_packet(a, TYPE_APP_REALTIME, 400, "self-send-test", 14,
+        (uint64_t)(time(NULL) +60));
 
     /**
-     * Set a short receive timeout so we do not block forever waiting for a
-     * message that should NOT arrive.
+     * B receives the message (verify routing works).
+     * Then verify A does not receive its own message.
+     * We check A after B to give the server time to process.
      */
-    struct timeval tv = {1, 0}; // 1 second timeout
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[1024] = {0};
+    uint32_t scope = 0, sid = 0;
+    int len = recv_app_packet(b, buf, sizeof(buf), &scope, &sid);
+    ASSERT(len > 0, "client B received the message");
 
-    char buf[1024];
-    int n = recv(fd, buf, sizeof(buf), 0);
-    ASSERT(n <= 0, "sender did not receive its own message");
+    /**
+     * Now check A does not receive its own message.
+     * Timeout is already set on the socket (RECV_TIMEOUT_S seconds).
+     * recv returning -1/EAGAIN means no data, correct behavior.
+     */
+    char drain[256];
+    ssize_t n = recv(a, drain, sizeof(drain), MSG_DONTWAIT);
+    ASSERT(n <= 0, "sender (A) did not receive its own message");
 
-    close(fd);
+    close(a);
+    close(b);
 }
 
 static void test_expired_packet_dropped(void)
@@ -322,7 +399,7 @@ static void test_ping(void)
 
     struct packet_header hdr;
     ssize_t n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-    ASSERT(n == sizeof(hdr), "received ping response header");
+    ASSERT(n == (ssize_t)sizeof(hdr), "received ping response header");
     ASSERT(hdr.type == TYPE_SYS_PING, "response type is TYPE_SYS_PING");
 
     close(fd);
@@ -371,6 +448,7 @@ int main(void)
     test_unauthenticated_packet_rejected();
     test_join_and_leave();
     test_double_join_rejected();
+    test_max_scopes_exhaustion();
     test_message_routing();
     test_sender_does_not_receive_own_message();
     test_expired_packet_dropped();

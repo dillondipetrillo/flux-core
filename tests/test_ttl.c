@@ -11,7 +11,7 @@
  *      if (expires_at != 0 && expires_at < (uint64_t)time(NULL))
  *          -> packet is expired, send STATUS_ERR_EXPIRED
  * 
- * We test the check logic directly without needing a running server.
+ * Tests all boundary conditions and realistic use cases.
  */
 
 // Replicate the exact check from dispatch_packet
@@ -112,6 +112,18 @@ static void test_message_ttl(void)
         "message that expired 1 second ago is dropped");
 }
 
+static void test_max_uint64_not_expired(void)
+{
+    printf("\n-- UINT64_MAX is not expired --\n");
+    /**
+     * A timestamp of UINT64_MAX is billions of years in the future.
+     * Verify the comparison handles large values without overflow.
+     */
+    time_t now = time(NULL);
+    ASSERT(is_expired(UINT64_MAX, now) == 0,
+        "UINT64_MAX expires_at is not expired");
+}
+
 int main(void)
 {
     printf("=== TTL expiry unit tests ===\n");
@@ -121,5 +133,6 @@ int main(void)
     test_exact_boundary();
     test_typing_indicator_ttl();
     test_message_ttl();
+    test_max_uint64_not_expired();
     TEST_SUMMARY();
 }
