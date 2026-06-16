@@ -70,12 +70,11 @@ tsan: $(ENGINE_SRCS)
 		-o server_tsan $(ENGINE_SRCS) $(LDFLAGS)
 
 integration: tests/test_integration.c src/logger.c
-	$(CC) $(CFLAGS) -o tests/run_integration \
+	$(CC) $(CFLAGS) -O2 -o tests/run_integration \
 		tests/test_integration.c src/logger.c -lpthread
 
-bench: bench/bench_routing.c src/logger.c
-	$(CC) $(CFLAGS) -O2 -o bench/bench_routing bench/bench_routing.c \
-		src/logger.c -lpthread
+bench: bench/bench_routing.c
+	$(CC) $(CFLAGS) -O2 -o bench/bench_routing bench/bench_routing.c
 
 debug: CFLAGS += -DDEBUG_LOG
 debug: all
