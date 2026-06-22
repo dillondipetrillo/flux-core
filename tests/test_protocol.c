@@ -80,6 +80,168 @@ static void test_packet_types(void)
     ASSERT(TYPE_APP_BACKGROUND == 12, "TYPE_APP_BACKGROUND is 12");
 }
 
+static void test_sliding_buffer_two_packets(void)
+{
+    printf("\n-- sliding buffer: two packets parsed in one offset pass --\n");
+
+    char buf[1024];
+    size_t recv_len = 0;
+    int processed = 0;
+
+    struct packet_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = (uint8_t)TYPE_APP_REALTIME;
+    hdr.payload_len = htonl(10);
+    const char *payload = "1234567890";
+
+    // Inject two back-to-back packets into the buffer
+    for (int i = 0; i < 2; i++) {
+        memcpy(buf + recv_len, &hdr, sizeof(hdr));
+        recv_len += sizeof(hdr);
+        memcpy(buf + recv_len, payload, 10);
+        recv_len += 10;
+    }
+
+    // Replicate the offset-accumulation parse from process_recv_buffer
+    size_t offset = 0;
+    while (recv_len - offset >= sizeof(struct packet_header)) {
+        struct packet_header *p = (struct packet_header *)(buf + offset);
+        uint32_t plen = ntohl(p->payload_len);
+        size_t total = sizeof(struct packet_header) + plen;
+        if (recv_len - offset < total) break;
+        processed++;
+        offset += total;
+    }
+
+    size_t remaining = recv_len - offset;
+    if (remaining > 0) memmove(buf, buf + offset, remaining);
+    recv_len = remaining;
+
+    ASSERT(processed == 2, "both packets parsed via offset accumulation");
+    ASSERT(recv_len == 0, "buffer cleanly exhausted, no leftover bytes");
+}
+
+static void test_sliding_buffer_partial_frame_preserved(void)
+{
+    printf("\n-- sliding buffer: partial trailing frame preserved --\n");
+
+    char buf[1024];
+    size_t recv_len = 0;
+    int processed = 0;
+
+    struct packet_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = (uint8_t)TYPE_APP_REALTIME;
+    hdr.payload_len = htonl(10);
+    const char *payload = "1234567890";
+
+    // One complete packet
+    memcpy(buf + recv_len, &hdr, sizeof(hdr));
+    recv_len += sizeof(hdr);
+    memcpy(buf + recv_len, payload, 10);
+    recv_len += 10;
+
+    // Plus a header-only partial fram (no payload bytes yet)
+    memcpy(buf + recv_len, &hdr, sizeof(hdr));
+    recv_len += sizeof(hdr);
+
+    size_t offset = 0;
+    while (recv_len - offset >= sizeof(struct packet_header)) {
+        struct packet_header *p = (struct packet_header *)(buf + offset);
+        uint32_t plen = ntohl(p->payload_len);
+        size_t total = sizeof(struct packet_header) + plen;
+        if (recv_len - offset < total) break;
+        processed++;
+        offset += total;
+    }
+
+    size_t remaining = recv_len - offset;
+    if (remaining > 0) memmove(buf, buf + offset, remaining);
+    recv_len = remaining;
+
+    ASSERT(processed == 1, "only the complete packet is processed");
+    ASSERT(recv_len == sizeof(struct packet_header),
+        "partial header-only frame preserved at buffer start");
+}
+
+static void test_send_queue_compacts_instead_of_overflowing(void)
+{
+    printf("\n-- send queue: compaction prevents false overflow --\n");
+
+    #define TEST_SEND_BUF 100
+    char send_buf[TEST_SEND_BUF];
+    size_t send_len = 0;
+    size_t send_offset = 0;
+    int disconnected = 0;
+
+    for (int round = 0; round < 20; round++) {
+        const char *chunk = "0123456789"; // 10 bytes per round
+        size_t len = 10;
+
+        // Compaction step
+        if (send_offset > 0) {
+            if (send_len > 0)
+                memmove(send_buf, send_buf + send_offset, send_len);
+            send_offset = 0;
+        }
+
+        if (send_len + len > TEST_SEND_BUF) {
+            disconnected = 1;
+            break;
+        }
+
+        memcpy(send_buf + send_len, chunk, len);
+        send_len += len;
+
+        // Simulate a partial drain: kernel accepts 7 of the 10+ queued bytes
+        // each round, mimicking a slow-but-alive receiver
+        size_t drained = send_len < 7 ? send_len : 7;
+        send_offset += drained;
+        send_len -= drained;
+    }
+
+    ASSERT(disconnected == 0,
+        "continuously backlogged-but-alive client is not falsely "
+        "disconnected once compaction reclaims drained space");
+
+    #undef TEST_SEND_BUF
+}
+
+static void test_send_queue_overflow_without_compaction_regresses(void)
+{
+    printf("\n-- send queue: confirms send overflow exists without "
+        "compaction --\n");
+
+    #define TEST_SEND_BUF 100
+    char send_buf[TEST_SEND_BUF];
+    size_t send_len = 0;
+    size_t send_offset = 0;
+    int disconnected = 0;
+
+    for (int round = 0; round < 20; round++) {
+        size_t len = 10;
+
+        // NOTE: no compaction here, this is the pre-fix behavior
+        if (send_offset + send_len + len > TEST_SEND_BUF) {
+            disconnected = 1;
+            break;
+        }
+
+        memcpy(send_buf + send_offset + send_len, "0123456789", len);
+        send_len += len;
+
+        size_t drained = send_len < 7 ? send_len : 7;
+        send_offset += drained;
+        send_len -= drained;
+    }
+
+    ASSERT(disconnected == 1,
+        "uncompacted send_offset growth eventually triggers a false "
+        "overflow disconnect");
+
+    #undef TEST_SEND_BUF
+}
+
 int main(void)
 {
     printf("=== protocol unit tests ===\n");
@@ -88,5 +250,9 @@ int main(void)
     test_zero_expires_never_expire();
     test_status_codes();
     test_packet_types();
+    test_sliding_buffer_two_packets();
+    test_sliding_buffer_partial_frame_preserved();
+    test_send_queue_compacts_instead_of_overflowing();
+    test_send_queue_overflow_without_compaction_regresses();
     TEST_SUMMARY();
 }

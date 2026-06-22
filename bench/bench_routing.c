@@ -435,7 +435,7 @@ static void bench_burst(int sender, int receiver)
     double pps = recvd > 0 ? recvd / elapsed: 0;
     double p_loss = (double)(sent - recvd) / sent * 100.0;
 
-    printf("\nBursdt Results:\n");
+    printf("\nBurst Results:\n");
     printf("    Sent:       %d packets\n", sent);
     printf("    Received:   %d packets\n", recvd);
     printf("    Lost:       %d (%.2f%%)\n", sent - recvd, p_loss);

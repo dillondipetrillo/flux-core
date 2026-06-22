@@ -438,6 +438,54 @@ static void test_leave_stops_routing(void)
     close(receiver);
 }
 
+static void test_burst_does_not_overflow_recv_buffer(void)
+{
+    printf("\n-- burst of small packets does not overflow recv buffer --\n");
+    int sender = connect_client();
+    int receiver = connect_client();
+    ASSERT(sender != -1, "sender can connect");
+    ASSERT(receiver != -1, "receiver can connect");
+    ASSERT(authenticate(sender), "sender authenticated");
+    ASSERT(authenticate(receiver), "receiver authenticated");
+
+    send_packet(sender, TYPE_SYS_JOIN, 700, NULL, 0, 0);
+    ASSERT(recv_response(sender) == STATUS_OK, "sender joined 700");
+    send_packet(receiver, TYPE_SYS_JOIN, 700, NULL, 0, 0);
+    ASSERT(recv_response(receiver) == STATUS_OK, "receiver joined 700");
+
+    /**
+     * Fire a burst of small packets back-to-back without waiting for ACKs.
+     * This reproduces the exact benchmark burst-mode pattern.
+     */
+    const int BURST = 2000;
+    time_t exp = time(NULL) + 60;
+    int send_failures = 0;
+    for (int i = 0; i < BURST; i++) {
+        if (!send_packet(sender, TYPE_APP_REALTIME, 700, "x", 1,
+            (uint64_t)exp))
+        {
+            send_failures++;
+        }
+    }
+    ASSERT(send_failures == 0, " all burst packets sent without error");
+
+    // Receiver must get all of them without the connection being dropped
+    int received = 0;
+    char buf[64];
+    uint32_t scope = 0, sid = 0;
+    for (int i = 0; i < BURST; i++) {
+        int len = recv_app_packet(receiver, buf, sizeof(buf), &scope, &sid);
+        if (len <= 0) break;
+        received++;
+    }
+
+    ASSERT(received == BURST,
+        "receiver got every packet in the burst without disconnection");
+
+    close(sender);
+    close(receiver);
+}
+
 int main(void)
 {
     printf("=== Integration tests (requires running server) ===\n");
@@ -454,6 +502,7 @@ int main(void)
     test_expired_packet_dropped();
     test_ping();
     test_leave_stops_routing();
+    test_burst_does_not_overflow_recv_buffer();
 
     TEST_SUMMARY();
 }
