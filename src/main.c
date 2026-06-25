@@ -33,7 +33,7 @@ static struct engine_config *g_config = NULL;
 static volatile sig_atomic_t parent_shutdown = 0;
 
 /**
- * parent_handle_sigterm - parent's SIGTERM/SIGINT handler.
+ * parent_handle_signal - parent's SIGTERM/SIGINT handler.
  * 
  * Sets the shutdown flag and forwards SIGTERM to all known workers.
  * Workers receive SIGTERM, their own signal handler sets engine_running=0,
@@ -43,15 +43,25 @@ static volatile sig_atomic_t parent_shutdown = 0;
  * We send SIGTERM not SIGKILL because workers need to run graceful shutdown.
  * SIGKILL would skip perform_graceful_shutdown entirely.
  */
-static void parent_handle_sigterm(int sig)
+static void parent_handle_signal(int sig)
 {
-    (void)sig;
-    parent_shutdown = 1;
-
-    // Forward to all known workers
-    for (int i = 0; i < worker_count_actual; i++) {
-        if(worker_pids[i] > 0) {
-            kill(worker_pids[i], SIGTERM);
+    if (sig == SIGTERM || sig == SIGINT) {
+        parent_shutdown = 1;
+        // Forward to all known workers
+        for (int i = 0; i < worker_count_actual; i++) {
+            if(worker_pids[i] > 0)
+                kill(worker_pids[i], SIGTERM);
+        }
+    } else if (sig == SIGHUP) {
+        /**
+         * Forward SIGHUP to all workers.
+         * Workers catch it in their own handle_sighup handler (in engine.c)
+         * which sets reopen_log = 1. Their event loop then calls
+         * logger_reopen() on the next iteration.
+         */
+        for (int i = 0; i < worker_count_actual; i++) {
+            if (worker_pids[i] > 0)
+                kill(worker_pids[i], SIGHUP);
         }
     }
 }
@@ -105,7 +115,7 @@ static void fork_worker(struct engine_config *config)
          * Child process.
          * 
          * Reset signal handlers: the child should NOT use the parent's
-         * SIGTERM handler (parent_handle_sigterm). The child needs its own
+         * SIGTERM handler (parent_handle_signal). The child needs its own
          * handler (handle_shutdown in engine.c) which sets engine_running=0.
          * engine_init registers the correct handlers - we just need to clear
          * the parent's handler first.
@@ -115,6 +125,12 @@ static void fork_worker(struct engine_config *config)
          */
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
+
+        if (logger_init(config->log_path) == -1) {
+            fprintf(stderr, "FATAL: Worker pid=%d could not open "
+                "log file: %s\n", (int)getpid(), config->log_path);
+            exit(1);
+        }
 
         if (engine_init(config) == -1) {
             log_error("Worker pid=%d: engine_init failed, exiting",
@@ -147,12 +163,13 @@ int main(void)
     struct engine_config config = config_load();
     g_config = &config;
 
-    if (logger_init(config.log_path) == -1) {
-        fprintf(stderr, "FATAL: could not open log file: %s\n",
+    // Initialize parent logger FIRST before config_log or any log calls.
+    if (logger_init_parent(config.log_path) == -1) {
+        fprintf(stderr, "FATAL: parent could not open log file: %s\n",
             config.log_path);
-        return 1;
+        return -1;
     }
-
+        
     config_log(&config);
 
     /**
@@ -162,7 +179,7 @@ int main(void)
      */
     if (engine_prefork_init(&config) == -1) {
         log_error("FATAL: engine_prefork_init failed");
-        logger_close();
+        logger_close_parent();
         return 1;
     }
 
@@ -222,8 +239,9 @@ int main(void)
      * Children will reset these to SIG_DFL before calling engine_init,
      * which registers the correct per-worker handlers.
      */
-    signal(SIGTERM, parent_handle_sigterm);
-    signal(SIGINT, parent_handle_sigterm);
+    signal(SIGTERM, parent_handle_signal);
+    signal(SIGINT, parent_handle_signal);
+    signal(SIGHUP, parent_handle_signal);
 
     // Initialize PID tracking array
     memset(worker_pids, 0, sizeof(worker_pids));
@@ -328,6 +346,6 @@ int main(void)
         }
     }
 
-    logger_close();
+    logger_close_parent();
     return 0;
 }

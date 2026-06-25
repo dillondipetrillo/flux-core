@@ -16,6 +16,7 @@ TEST_CONN_MAP = tests/test_conn_map.c src/conn_map.c
 TEST_PROTOCOL = tests/test_protocol.c
 TEST_RATE_LIMIT = tests/test_rate_limit.c
 TEST_SCOPE_MAP = tests/test_scope_map.c src/scope_map.c
+TEST_TTL = tests/test_ttl.c
 
 all: server client
 
@@ -44,22 +45,48 @@ tests/run_rate_limit: $(TEST_RATE_LIMIT)
 tests/run_scope_map: $(TEST_SCOPE_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SCOPE_MAP)
 
+tests/run_ttl: $(TEST_TTL)
+	$(CC) $(CFLAGS) -o $@ $(TEST_TTL)
+
 test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
-		tests/run_conn_map tests/run_protocol
+		tests/run_conn_map tests/run_protocol tests/run_ttl
 	./tests/run_auth
 	./tests/run_conn_map
 	./tests/run_protocol
 	./tests/run_rate_limit
 	./tests/run_scope_map
+	./tests/run_ttl
 	@echo "All unit tests passed."
 
+# AddressSanitizer + UndefinedBehaviorSanitizer
 sanitize: $(ENGINE_SRCS)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -o server_san \
-		$(ENGINE_SRCS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o server_san $(ENGINE_SRCS) $(LDFLAGS)
+
+# ThreadSanitizer - detects data races between threads
+# Run separately from ASan - they cannot be combined
+tsan: $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer \
+		-o server_tsan $(ENGINE_SRCS) $(LDFLAGS)
+
+integration: tests/test_integration.c src/logger.c
+	$(CC) $(CFLAGS) -O2 -o tests/run_integration \
+		tests/test_integration.c src/logger.c -lpthread
+
+bench: bench/bench_routing.c
+	$(CC) $(CFLAGS) -O2 -o bench/bench_routing bench/bench_routing.c
+
+debug: CFLAGS += -DDEBUG_LOG
+debug: all
+
+# Optimized production binary for benchmarking
+server_opt: $(ENGINE_SRCS)
+	$(CC) -Wall -Wextra -O2 -Iinclude -o server_opt $(ENGINE_SRCS) $(LDFLAGS)
 
 clean:
-	rm -f server client server_san
+	rm -f server client server_san server_opt server_tsan
 	rm -rf tests/run_*
+	rm -rf bench/bench_routing
 	rm -rf *.dSYM
 
-.PHONY: all clean
+.PHONY: all test integration sanitize tsan bench debug clean

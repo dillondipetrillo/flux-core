@@ -4,14 +4,16 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+// Core logging
 int logger_init(const char *filepath);
 void logger_close(void);
-
+void logger_reopen(void);
 void log_info(const char *fmt, ...);
 void log_error(const char *fmt, ...);
 
-// Log rotation - called when SIGHUP fires
-void logger_reopen(void);
+// Parent process logging
+int logger_init_parent(const char *filepath);
+void logger_close_parent(void);
 
 // Billing log - structured JSON events for usage tracking
 int billing_log_init(const char *filepath);

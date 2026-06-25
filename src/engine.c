@@ -8,6 +8,7 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -59,7 +60,7 @@ static int free_count = 0;
  * matching IP. If not found, an empty slot is used, or the slot with the
  * oldest window_start is evicted.
  */
-#define RATE_MAP_SIZE 256
+#define RATE_MAP_SIZE 8192
 #define RATE_MAP_WAYS 4
 
 struct rate_slot {
@@ -94,6 +95,8 @@ static void process_recv_buffer(struct client_info *client, int fd);
 static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
     uint32_t scope_id, uint32_t sender_id, uint64_t expires_at, char *payload,
     uint32_t payload_len);
+static int engine_send_vector(int fd, const struct packet_header *hdr,
+    const char *payload, uint32_t payload_len);
 static void engine_send_response(int fd, enum packet_type type,
     enum status_code code);
 static int engine_send(int fd, const char *data, size_t len);
@@ -185,10 +188,20 @@ int engine_init (struct engine_config *config)
      * SIG_IGN makes send() return -1 with errno=EPIPE instead, which our
      * error handling already handles correctly.
      */
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGTERM, handle_shutdown);
-    signal(SIGINT, handle_shutdown);
-    signal(SIGHUP, handle_sighup);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+
+    sa.sa_handler = handle_shutdown;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    sa.sa_handler = handle_sighup;
+    sigaction(SIGHUP, &sa, NULL);
     log_info("Signal handlers registered (worker pid=%d)", (int)getpid());
 
     
@@ -525,16 +538,32 @@ static int engine_send(int fd, const char *data, size_t len)
 static int engine_queue_send(struct client_info *client, const char *data,
     size_t len)
 {
-    // Check if data fits in the send buffer
-    if (client->send_offset + client->send_len + len > MAX_SEND_BUFF) {
+    /**
+     * Compact first: if we've already drained some bytes from the front
+     * (send_offset > 0), shift the remaining unsent bytes back to the
+     * start of the buffer before appending more. Without this, send_offset
+     * only ever grows until the queue fully empties, so a receiver that
+     * stays continuously backlogged (the exact burst-mode pattern) sees
+     * available space shrink to zero even though most of the buffer is
+     * actually free. That falsely trips the overflow check below and
+     * disconnects a healthy, just-slow client.
+     */
+    if (client->send_offset > 0) {
+        if (client->send_len > 0) {
+            memmove(client->send_buf, client->send_buf + client->send_offset,
+                client->send_len);
+        }
+        client->send_offset = 0;
+    }
+
+    if (client->send_len + len > MAX_SEND_BUFF) {
         log_error("Send buffer overflow fd=%d, disconnecting",
             client->socket_fd);
         disconnect_client(client->socket_fd);
         return -1;
     }
 
-    memcpy(client->send_buf + client->send_offset + client->send_len, data,
-        len);
+    memcpy(client->send_buf + client->send_len, data, len);
     client->send_len += len;
 
     // Register for EPOLLOUT to drain the queue when writeable
@@ -542,6 +571,76 @@ static int engine_queue_send(struct client_info *client, const char *data,
     ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
     ev.data.fd = client->socket_fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, client->socket_fd, &ev);
+    return 0;
+}
+
+/**
+ * engine_send_vector - send a header and payload as one atomic operation.
+ * 
+ * Uses writev() to push both buffers to the kernel in a single syscall
+ * instead of two separate send() calls. Falls back to the existing
+ * engine_queue_send() backpressure path on partial writes or EAGAIN,
+ * preserving strict byte ordering with anything already queued.
+ */
+static int engine_send_vector(int fd, const struct packet_header *hdr,
+    const char *payload, uint32_t payload_len)
+{
+    struct client_info *client = conn_map_get(&conn_map, fd);
+    if (!client) return -1;
+
+    if (client->send_len > 0) {
+        if (engine_queue_send(client, (const char *)hdr,
+            sizeof(struct packet_header)) == -1) return -1;
+        if (payload_len > 0)
+            return engine_queue_send(client, payload, payload_len);
+        return 0;
+    }
+
+    struct iovec iov[2];
+    iov[0].iov_base = (void *)hdr;
+    iov[0].iov_len = sizeof(struct packet_header);
+    int iovcnt = 1;
+
+    if (payload_len > 0) {
+        iov[1].iov_base = (void *)payload;
+        iov[1].iov_len = payload_len;
+        iovcnt = 2;
+    }
+
+    size_t total_expected = sizeof(struct packet_header) + payload_len;
+    ssize_t n = writev(fd, iov, iovcnt);
+
+    if (n == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (engine_queue_send(client, (const char *)hdr,
+                sizeof(struct packet_header)) == -1) return -1;
+            if (payload_len > 0)
+                return engine_queue_send(client, payload, payload_len);
+            return 0;
+        }
+        disconnect_client(fd);
+        return -1;
+    }
+
+    client->bytes_sent += (uint64_t)n;
+    size_t written = (size_t)n;
+
+    if (written == total_expected) return 0; // fully sent, common case
+
+    // Partial write - queue the remainder, preserving order
+    if (written < sizeof(struct packet_header)) {
+        size_t hdr_left = sizeof(struct packet_header) - written;
+        if (engine_queue_send(client, (const char *)hdr + written,
+            hdr_left) == -1) return -1;
+        if (payload_len > 0)
+            return engine_queue_send(client, payload, payload_len);
+    } else {
+        size_t payload_written = written - sizeof(struct packet_header);
+        size_t payload_left = payload_len - payload_written;
+        if (payload_left > 0)
+            return engine_queue_send(client, payload + payload_written,
+                payload_left);
+    }
     return 0;
 }
 
@@ -563,8 +662,7 @@ static void engine_send_response(int fd, enum packet_type type,
     struct response_payload rp;
     rp.status_code = htonl((uint32_t)code);
 
-    engine_send(fd, (const char *)&hdr, sizeof(hdr));
-    engine_send(fd, (const char *)&rp, sizeof(rp));
+    engine_send_vector(fd, &hdr, (const char *)&rp, sizeof(rp));
 }
 
 static int client_in_scope(const struct client_info *client,
@@ -720,8 +818,9 @@ static void handle_new_connections(void)
         ev.data.fd = client_fd;
         epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
 
-        log_info("Connected fd=%d ip=%s", client_fd,
-            inet_ntoa(client_addr.sin_addr));
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
+        log_info("Connected fd=%d ip=%s", client_fd, ip_str);
         billing_log_connect(client_fd, &client_addr);
     }
 }
@@ -766,9 +865,24 @@ static void handle_client_readable(int fd)
 
         client->recv_len += (size_t)n;
         client->bytes_recv += (uint64_t)n;
+        
+        /**
+         * Process immediately, not after the loop. This reclaims recv_buf space
+         * as packets are parsed, so the buffer never has to absorb an entire
+         * burst before a single byte is consumed. Without this, MAX_BUFF_SIZE
+         * gets exhausted mid-burst even though complete packets are sitting in
+         * the buffer ready to be parsed.
+         * 
+         * process_recv_buffer() may call disconnect_client() internally
+         * (oversized payload). client_info is heap-owned and the pool slot is
+         * recycled inside disconnect_client(), so we must stop touching 'client'
+         * immediately after this call returns if that happened. We re-fetch
+         * nothing here because we simply return, the fd is already gone from
+         * conn_map by the time control comes back to us.
+         */
+        process_recv_buffer(client, fd);
+        if (conn_map_get(&conn_map, fd) == NULL) return; //disconnected mid-parse
     }
-
-    process_recv_buffer(client, fd);
 }
 
 /**
@@ -784,16 +898,19 @@ static void handle_client_readable(int fd)
  */
 static void process_recv_buffer(struct client_info *client, int fd)
 {
-    while (client->recv_len >= sizeof(struct packet_header)) {
-        // Peek, don't consume yet
-        struct packet_header hdr;
-        memcpy(&hdr, client->recv_buf, sizeof(hdr));
+    size_t offset = 0;
+    const size_t header_sz = sizeof(struct packet_header);
+
+    while (client->recv_len - offset >= header_sz) {
+        // Zero-copy: cast directly over the buffer, no per-packet memcpy
+        struct packet_header *hdr =
+            (struct packet_header *)(client->recv_buf + offset);
 
         // Convert from network byte order to host byte order
-        uint32_t payload_len = ntohl(hdr.payload_len);
-        uint32_t scope_id = ntohl(hdr.scope_id);
-        uint64_t expires_at = be64toh(hdr.expires_at);
-        uint8_t type = hdr.type;
+        uint32_t payload_len = ntohl(hdr->payload_len);
+        uint32_t scope_id = ntohl(hdr->scope_id);
+        uint64_t expires_at = be64toh(hdr->expires_at);
+        uint8_t type = hdr->type;
 
         if (payload_len > MAX_PAYLOAD) {
             log_error("Oversized payload %u fd=%d, disconnecting", payload_len,
@@ -802,11 +919,11 @@ static void process_recv_buffer(struct client_info *client, int fd)
             return;
         }
 
-        size_t total = sizeof(struct packet_header) + payload_len;
-        if (client->recv_len < total) break; // Wait for more data
+        size_t total = header_sz + payload_len;
+        if (client->recv_len - offset < total) break; // partial frame, wait
 
         // Complete packet available
-        char *payload = client->recv_buf + sizeof(struct packet_header);
+        char *payload = client->recv_buf + offset + header_sz;
 
         // Server stamps sender_id, client cannot spoof identity
         uint32_t sender_id = (uint32_t)fd;
@@ -814,10 +931,15 @@ static void process_recv_buffer(struct client_info *client, int fd)
         dispatch_packet(client, fd, type, scope_id, sender_id, expires_at,
             payload, payload_len);
 
-        // Remove processed packet from buffer
-        memmove(client->recv_buf, client->recv_buf + total,
-            client->recv_len - total);
-        client-> recv_len -= total;
+        offset += total;
+    }
+
+    // Single memmove per call, not per packet
+    if (offset > 0) {
+        size_t remaining = client->recv_len - offset;
+        if (remaining > 0)
+            memmove(client->recv_buf, client->recv_buf + offset, remaining);
+        client->recv_len = remaining;
     }
 }
 
@@ -961,9 +1083,7 @@ static int route_to_scope_map(int sender_fd, uint32_t scope_id,
     int routed = 0;
     for (int i = 0; i < count; i++) {
         if (fds[i] == sender_fd) continue; // never echo to sender
-        engine_send(fds[i], (const char *)&out, sizeof(out));
-        if (payload_len > 0)
-            engine_send(fds[i], payload, payload_len);
+        engine_send_vector(fds[i], &out, payload, payload_len);
         routed++;
     }
     return routed;
@@ -1001,7 +1121,7 @@ static void handle_client_writable(int fd)
 
         client->bytes_sent += (uint64_t)n;
         client->send_offset += (size_t)n;
-        client->send_len += (size_t)n;
+        client->send_len -= (size_t)n;
     }
 
     // Queue drained - reset and stop watching writability
@@ -1032,25 +1152,31 @@ static void handle_client_writable(int fd)
  */
 static void handle_health_check(void)
 {
-    int fd = accept(health_fd, NULL, NULL);
-    if (fd == -1) return;
-
-    char response[512];
-    int n = snprintf(response, sizeof(response),
-        "STATUS OK\r\n"
-        "WORKER_PID %d\r\n"
-        "CONNECTIONS %d\r\n"
-        "POOL_FREE %d\r\n"
-        "POOL_MAX %d\r\n"
-        "UPTIME %lu\r\n",
-        (int)getpid(),
-        conn_map_count(&conn_map),
-        free_count,
-        cfg->max_clients,
-        (unsigned long)(time(NULL) - start_time));
-
-    send(fd, response, (size_t)n, MSG_DONTWAIT);
-    close(fd);
+    while (1) {
+        int fd = accept(health_fd, NULL, NULL);
+        if (fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+            break;
+        }
+    
+        char response[512];
+        int n = snprintf(response, sizeof(response),
+            "STATUS OK\r\n"
+            "WORKER_PID %d\r\n"
+            "CONNECTIONS %d\r\n"
+            "POOL_FREE %d\r\n"
+            "POOL_MAX %d\r\n"
+            "UPTIME %lu\r\n",
+            (int)getpid(),
+            conn_map_count(&conn_map),
+            free_count,
+            cfg->max_clients,
+            (unsigned long)(time(NULL) - start_time));
+    
+        send(fd, response, (size_t)n, MSG_DONTWAIT);
+        close(fd);
+    }
 }
 
 /**
