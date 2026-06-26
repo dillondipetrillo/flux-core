@@ -12,6 +12,7 @@ ENGINE_SRCS = src/main.c \
 	src/utils.c
 
 TEST_AUTH = tests/test_auth_hook.c src/auth_hook.c src/logger.c
+TEST_CONN_ID = tests/test_conn_id.c
 TEST_CONN_MAP = tests/test_conn_map.c src/conn_map.c
 TEST_PROTOCOL = tests/test_protocol.c
 TEST_RATE_LIMIT = tests/test_rate_limit.c
@@ -33,6 +34,9 @@ client: src/client.c src/config.c src/utils.c src/logger.c
 tests/run_auth: $(TEST_AUTH)
 	$(CC) $(CFLAGS) -o $@ $(TEST_AUTH) $(LDFLAGS)
 
+tests/run_conn_id: $(TEST_CONN_ID)
+	$(CC) $(CFLAGS) -o $@ $(TEST_CONN_ID)
+
 tests/run_conn_map: $(TEST_CONN_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_CONN_MAP)
 
@@ -49,8 +53,10 @@ tests/run_ttl: $(TEST_TTL)
 	$(CC) $(CFLAGS) -o $@ $(TEST_TTL)
 
 test: tests/run_auth tests/run_rate_limit tests/run_scope_map \
-		tests/run_conn_map tests/run_protocol tests/run_ttl
+		tests/run_conn_map tests/run_protocol tests/run_ttl \
+		tests/run_conn_id
 	./tests/run_auth
+	./tests/run_conn_id
 	./tests/run_conn_map
 	./tests/run_protocol
 	./tests/run_rate_limit

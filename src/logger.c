@@ -45,6 +45,7 @@
  * logger_init() which confirms async mode.
  */
 static int parent_mode = 0;
+static pid_t cached_pid = 0;
 
 struct log_entry {
     char msg[LOG_ENTRY_SIZE];
@@ -197,7 +198,8 @@ static void log_write(const char *level, const char *fmt, va_list args)
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 
         char msg[LOG_ENTRY_SIZE];
-        int prefix = snprintf(msg, LOG_ENTRY_SIZE, "[%s] %-5s ", ts, level);
+        int prefix = snprintf(msg, LOG_ENTRY_SIZE, "[%s] %-5s pid=%d ",
+            ts, level, (int)cached_pid);
         if (prefix > 0 && prefix < LOG_ENTRY_SIZE)
             vsnprintf(msg + prefix, LOG_ENTRY_SIZE - prefix - 1, fmt, args);
         // Ensure newline
@@ -234,7 +236,8 @@ static void log_write(const char *level, const char *fmt, va_list args)
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 
-    int prefix = snprintf(e->msg, LOG_ENTRY_SIZE, "[%s] %-5s ", ts, level);
+    int prefix = snprintf(e->msg, LOG_ENTRY_SIZE, "[%s] %-5s pid=%d ",
+        ts, level, (int)cached_pid);
     if (prefix < 0 || prefix >= LOG_ENTRY_SIZE) {
         e->len = 0;
         atomic_store_explicit(&write_head, wh + 1, memory_order_release);
@@ -284,6 +287,7 @@ void log_error(const char *fmt, ...)
 int logger_init(const char *filepath)
 {
     parent_mode = 0; // worker mode, use async ring buffer
+    cached_pid = getpid();
 
     if (filepath && *filepath) {
         strncpy(log_path_stored, filepath, sizeof(log_path_stored) - 1);
@@ -420,6 +424,7 @@ void logger_reopen(void)
 int logger_init_parent(const char *filepath)
 {
     parent_mode = 1;
+    cached_pid = getpid();
 
     if (filepath && *filepath) {
         strncpy(log_path_stored, filepath, sizeof(log_path_stored) - 1);
