@@ -17,6 +17,7 @@ TEST_CONN_MAP = tests/test_conn_map.c src/conn_map.c
 TEST_PROTOCOL = tests/test_protocol.c
 TEST_RATE_LIMIT = tests/test_rate_limit.c
 TEST_SCOPE_MAP = tests/test_scope_map.c src/scope_map.c
+TEST_SHUTDOWN_INTEGRATION = tests/test_shutdown_integration.c
 TEST_TTL = tests/test_ttl.c
 
 all: server client
@@ -48,6 +49,9 @@ tests/run_rate_limit: $(TEST_RATE_LIMIT)
 
 tests/run_scope_map: $(TEST_SCOPE_MAP)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SCOPE_MAP)
+
+tests/run_shutdown_integration: $(TEST_SHUTDOWN_INTEGRATION)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SHUTDOWN_INTEGRATION)
 
 tests/run_ttl: $(TEST_TTL)
 	$(CC) $(CFLAGS) -o $@ $(TEST_TTL)

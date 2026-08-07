@@ -558,8 +558,9 @@ static int engine_queue_send(struct client_info *client, const char *data,
     }
 
     if (client->send_len + len > MAX_SEND_BUFF) {
-        log_error("Send buffer overflow fd=%d, disconnecting",
-            client->socket_fd);
+        log_error("conn_id=%lu fd=%d user_id=%u Send buffer overflow, "
+            "disconnecting", (unsigned long)client->conn_id, client->socket_fd,
+            client->user_id);
         disconnect_client(client->socket_fd);
         return -1;
     }
@@ -848,7 +849,9 @@ static void handle_client_readable(int fd)
     while (1) {
         size_t space = MAX_BUFF_SIZE - client->recv_len;
         if (space == 0) {
-            log_error("Recv buffer full fd=%d, disconnecting", fd);
+            log_error("conn_id=%lu fd=%d user_id=%u Recv buffer full, "
+                "disconnecting", (unsigned long)client->conn_id, fd,
+                client->user_id);
             disconnect_client(fd);
             return;
         }
@@ -917,8 +920,9 @@ static void process_recv_buffer(struct client_info *client, int fd)
         uint8_t type = hdr->type;
 
         if (payload_len > MAX_PAYLOAD) {
-            log_error("Oversized payload %u fd=%d, disconnecting", payload_len,
-                fd);
+            log_error("conn_id=%lu fd=%d user_id=%u Oversized payload %u, "
+                "disconnecting", (unsigned long)client->conn_id, fd,
+                client->user_id, payload_len);
             disconnect_client(fd);
             return;
         }

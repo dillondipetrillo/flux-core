@@ -2,11 +2,13 @@
 server
 client
 server_san
+tests/run_shutdown_integration
 
 # Build artifacts
 *.o
 .DS_Store
 *.dSYM
+/tmp/shutdown_test_ready
 
 # Runtime log files
 logs/*

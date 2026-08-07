@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -242,6 +243,30 @@ static void test_send_queue_overflow_without_compaction_regresses(void)
     #undef TEST_SEND_BUF
 }
 
+static void test_documented_byte_offets_match_struct(void)
+{
+    printf("\n-- documented wire offets match actual struct layout --\n");
+
+    /**
+     * These offsets are published in README.md / protocol documentation
+     * as the locked v1 wire format. If this tes ever fails, it means
+     * someone changed packet_header's field order or types without
+     * updating the locked documentation.
+     */
+    ASSERT(offsetof(struct packet_header, type) == 0,
+        "type is at documented offset 0");
+    ASSERT(offsetof(struct packet_header, payload_len) == 1,
+        "payload_len is at documented offset 1");
+    ASSERT(offsetof(struct packet_header, scope_id) == 5,
+        "scope_id is at documented offset 5");
+    ASSERT(offsetof(struct packet_header, sender_id) == 9,
+        "sender_id is at documented offset 9");
+    ASSERT(offsetof(struct packet_header, expires_at) == 13,
+        "expires_at is at documented offset 13");
+    ASSERT(sizeof(struct packet_header) == 21,
+        "total packed header size matches documented 21 bytes");
+}
+
 int main(void)
 {
     printf("=== protocol unit tests ===\n");
@@ -254,5 +279,6 @@ int main(void)
     test_sliding_buffer_partial_frame_preserved();
     test_send_queue_compacts_instead_of_overflowing();
     test_send_queue_overflow_without_compaction_regresses();
+    test_documented_byte_offets_match_struct();
     TEST_SUMMARY();
 }

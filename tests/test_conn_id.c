@@ -37,12 +37,8 @@ static void test_conn_id_never_repeats(void)
     
     int duplicate_found = 0;
     for (int i = 0; i < 1000 && !duplicate_found; i++) {
-        for (int j = i + 1; j < 1000; j++) {
-            if (seen[i] == seen[j]) {
-                duplicate_found = 1;
-                break;
-            }
-        }
+        for (int j = i + 1; j < 1000; j++)
+            if (seen[i] == seen[j]) duplicate_found = 1;
     }
 
     ASSERT(duplicate_found == 0,
