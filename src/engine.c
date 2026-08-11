@@ -961,6 +961,14 @@ static void process_recv_buffer(struct client_info *client, int fd)
  * The security gate: all non-IDENTIFY packets require authentication.
  * Unauthenticated packets receive an error response but the connection is kept
  * open - the client can still auth.
+ * 
+ * IMPORTANT - payload lifetime: 'payload' points directly into the calling
+ * client's recv_buf (zero-copy - see process_recv_buffer). This pointer
+ * becomes invalid the instant disconnect_client() is called for this
+ * connection, since disconnect_client() frees recv_buf. Every case in the
+ * switch below that calls disconnect_client() must do so as its FINAL use of
+ * 'payload', 'client', or any field derived from them - never add code after
+ * a disconnect_client() call within the same case that reads 'payload' again.
  */
 static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
     uint32_t scope_id, uint32_t sender_id, uint64_t expires_at, char *payload,
