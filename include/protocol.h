@@ -41,7 +41,7 @@ struct client_info {
     int is_authenticated;           // 1 after successful IDENTIFY
     int scope_count;
     int socket_fd;
-    uint32_t client_id;
+    uint64_t conn_id;               // monotonic, process-lifetime-unique
     uint32_t scopes[MAX_SCOPES];
     uint32_t user_id;               // returned by auth hook
     char *recv_buf;                 // accumulates partial packets

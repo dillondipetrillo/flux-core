@@ -1,3 +1,4 @@
+name: flux-core-dev
 services:
     engine:
         build:

@@ -42,6 +42,7 @@ static int health_fd = -1;
 static struct engine_config *cfg = NULL;
 static auth_hook_fn current_hook = NULL;
 static time_t start_time = 0;
+static uint64_t next_conn_id = 1; // 0 is reserved as "connection not assigned"
 
 static struct scope_map scope_map;
 static struct conn_map conn_map;
@@ -459,7 +460,7 @@ static struct client_info *pool_alloc(void)
      * addresses.
      */
     client->socket_fd = -1;
-    client->client_id = 0;
+    client->conn_id = next_conn_id++; // assign once, never changes
     client->user_id = 0;
     client->scope_count = 0;
     client->is_authenticated = 0;
@@ -557,8 +558,9 @@ static int engine_queue_send(struct client_info *client, const char *data,
     }
 
     if (client->send_len + len > MAX_SEND_BUFF) {
-        log_error("Send buffer overflow fd=%d, disconnecting",
-            client->socket_fd);
+        log_error("conn_id=%lu fd=%d user_id=%u Send buffer overflow, "
+            "disconnecting", (unsigned long)client->conn_id, client->socket_fd,
+            client->user_id);
         disconnect_client(client->socket_fd);
         return -1;
     }
@@ -706,11 +708,13 @@ static void disconnect_client(int fd)
     }
 
     if (client->is_authenticated)
-        log_info("Disconnected fd=%d user_id=%u bytes_sent=%lu bytes_recv=%lu",
-            fd, client->user_id, (unsigned long)client->bytes_sent,
+        log_info("conn_id=%lu fd=%d user_id=%u Disconnected bytes_sent=%lu "
+            "bytes_recv=%lu", (unsigned long)client->conn_id, fd,
+            client->user_id, (unsigned long)client->bytes_sent,
             (unsigned long)client->bytes_recv);
     else
-        log_info("Disconnected unauthenticated fd=%d", fd);
+        log_info("conn_id=%lu fd=%d user_id=0 Disconnected unauthenticated",
+            (unsigned long)client->conn_id, fd);
 
     billing_log_disconnect(fd, client->user_id, client->bytes_sent,
         client->bytes_recv);
@@ -820,7 +824,8 @@ static void handle_new_connections(void)
 
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
-        log_info("Connected fd=%d ip=%s", client_fd, ip_str);
+        log_info("conn_id=%lu fd=%d user_id=0 Connected ip=%s",
+            (unsigned long)client->conn_id, client_fd, ip_str);
         billing_log_connect(client_fd, &client_addr);
     }
 }
@@ -844,7 +849,9 @@ static void handle_client_readable(int fd)
     while (1) {
         size_t space = MAX_BUFF_SIZE - client->recv_len;
         if (space == 0) {
-            log_error("Recv buffer full fd=%d, disconnecting", fd);
+            log_error("conn_id=%lu fd=%d user_id=%u Recv buffer full, "
+                "disconnecting", (unsigned long)client->conn_id, fd,
+                client->user_id);
             disconnect_client(fd);
             return;
         }
@@ -913,8 +920,9 @@ static void process_recv_buffer(struct client_info *client, int fd)
         uint8_t type = hdr->type;
 
         if (payload_len > MAX_PAYLOAD) {
-            log_error("Oversized payload %u fd=%d, disconnecting", payload_len,
-                fd);
+            log_error("conn_id=%lu fd=%d user_id=%u Oversized payload %u, "
+                "disconnecting", (unsigned long)client->conn_id, fd,
+                client->user_id, payload_len);
             disconnect_client(fd);
             return;
         }
@@ -953,6 +961,14 @@ static void process_recv_buffer(struct client_info *client, int fd)
  * The security gate: all non-IDENTIFY packets require authentication.
  * Unauthenticated packets receive an error response but the connection is kept
  * open - the client can still auth.
+ * 
+ * IMPORTANT - payload lifetime: 'payload' points directly into the calling
+ * client's recv_buf (zero-copy - see process_recv_buffer). This pointer
+ * becomes invalid the instant disconnect_client() is called for this
+ * connection, since disconnect_client() frees recv_buf. Every case in the
+ * switch below that calls disconnect_client() must do so as its FINAL use of
+ * 'payload', 'client', or any field derived from them - never add code after
+ * a disconnect_client() call within the same case that reads 'payload' again.
  */
 static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
     uint32_t scope_id, uint32_t sender_id, uint64_t expires_at, char *payload,
@@ -992,9 +1008,9 @@ static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
             client->session_token[tlen] = '\0';
             client->is_authenticated = 1;
             client->user_id = result.user_id;
-            client->client_id = (uint32_t)fd;
 
-            log_info("Authenticated fd=%d user_id=%d", fd, result.user_id);
+            log_info("conn_id=%lu fd=%d user_id=%u Authenticated",
+                (unsigned long)client->conn_id, fd, result.user_id);
             engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
             billing_log_auth(fd, result.user_id);
             break;
@@ -1013,7 +1029,8 @@ static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
             }
             client->scopes[client->scope_count++] = scope_id;
             scope_map_add(&scope_map, scope_id, fd);
-            log_info("fd=%d joined scope=%u", fd, scope_id);
+            log_info("conn_id=%lu fd=%d user_id=%u joined scope=%u",
+                (unsigned long)client->conn_id, fd, client->user_id, scope_id);
             engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
             break;
         }
@@ -1025,7 +1042,8 @@ static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
                 break;
             }
             scope_map_remove(&scope_map, scope_id, fd);
-            log_info("fd=%d left scope=%u", fd, scope_id);
+            log_info("conn_id=%lu fd=%d user_id=%u left scope=%u",
+                (unsigned long)client->conn_id, fd, client->user_id, scope_id);
             engine_send_response(fd, TYPE_SYS_ACK, STATUS_OK);
             break;
         }
@@ -1045,7 +1063,9 @@ static void dispatch_packet(struct client_info *client, int fd, uint8_t type,
         default: {
             // Application data - check TTL then route
             if (expires_at != 0 && expires_at < (uint64_t)time(NULL)) {
-                log_info("TTL expired fd=%d scope=%u", fd, scope_id);
+                log_info("conn_id=%lu fd=%d user_id=%u TTL expired scope=%u",
+                    (unsigned long)client->conn_id, fd, client->user_id,
+                    scope_id);
                 engine_send_response(fd, TYPE_SYS_ERROR, STATUS_ERR_EXPIRED);
                 break;
             }
@@ -1227,8 +1247,9 @@ static void shutdown_callback(int fd, struct client_info *client,
          * will get a broken pipe when we close the fd. This is acceptable,
          * we made a best-effort notification.
          */
-        log_info("Shutdown notification not delivered to fd=%d "
-            "(send returned %zd)", fd, sent);
+        log_info("conn_id=%lu fd=%d user_id=%u Shutdown notification "
+            "not delivered (send returned %zd)",
+            (unsigned long)client->conn_id, fd, client->user_id, sent);
     }
 }
 
